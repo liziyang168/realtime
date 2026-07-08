@@ -6,10 +6,10 @@ defmodule Realtime.Tenants.TempStateStoreTest do
 
   setup do
     tenant = Containers.checkout_tenant(run_migrations: true)
-    {:ok, db_conn} = Connect.lookup_or_start_connection(tenant.external_id)
+    {:ok, _db_conn} = Connect.lookup_or_start_connection(tenant.external_id)
     channel_name = "room:" <> random_string()
-    {:ok, store} = TempStateStore.start(tenant, self(), channel_name, db_conn)
-    %{tenant: tenant, store: store, channel_name: channel_name, db_conn: db_conn}
+    {:ok, store} = TempStateStore.start(tenant, self(), channel_name)
+    %{tenant: tenant, store: store, channel_name: channel_name}
   end
 
   describe "put/3" do
@@ -85,8 +85,30 @@ defmodule Realtime.Tenants.TempStateStoreTest do
       assert %{value: %{"nested" => [1, 2, 3]}, version: 1, updated_at: %DateTime{}} = result
     end
 
+    test "scalar values round-trip unchanged", %{store: store} do
+      # regression: values used to be double-JSON-encoded, corrupting scalars
+      assert {:ok, 1} = TempStateStore.put(store, "string", "hello")
+      assert {:ok, %{value: "hello"}} = TempStateStore.get(store, "string")
+
+      assert {:ok, 1} = TempStateStore.put(store, "numeric string", "123")
+      assert {:ok, %{value: "123"}} = TempStateStore.get(store, "numeric string")
+
+      assert {:ok, 1} = TempStateStore.put(store, "int", 42)
+      assert {:ok, %{value: 42}} = TempStateStore.get(store, "int")
+    end
+
     test "returns :not_found when the key is missing", %{store: store} do
       assert {:error, :not_found} = TempStateStore.get(store, "missing")
+    end
+  end
+
+  describe "key validation" do
+    test "rejects non-string keys without crashing the store", %{store: store} do
+      assert {:error, :invalid_key} = TempStateStore.put(store, 123, %{})
+      assert {:error, :invalid_key} = TempStateStore.get(store, 123)
+      assert {:error, :invalid_key} = TempStateStore.delete(store, %{"key" => "k"})
+      assert Process.alive?(store)
+      assert {:ok, 1} = TempStateStore.put(store, "k", %{})
     end
   end
 
@@ -122,12 +144,23 @@ defmodule Realtime.Tenants.TempStateStoreTest do
   end
 
   describe "lifecycle" do
-    test "the store stops when the monitored process goes down", %{tenant: tenant, db_conn: db_conn} do
+    test "the store stops when the monitored process goes down", %{tenant: tenant} do
       monitored = spawn(fn -> Process.sleep(:infinity) end)
-      {:ok, store} = TempStateStore.start(tenant, monitored, "room:" <> random_string(), db_conn)
+      {:ok, store} = TempStateStore.start(tenant, monitored, "room:" <> random_string())
       ref = Process.monitor(store)
 
       Process.exit(monitored, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^store, _reason}, 2000
+    end
+
+    test "the store stops when the tenant Connect process goes down", %{tenant: tenant} do
+      {:ok, store} = TempStateStore.start(tenant, self(), "room:" <> random_string())
+      # wait for the async connect (which monitors Connect) to complete
+      assert {:ok, 1} = TempStateStore.put(store, "k", %{})
+      ref = Process.monitor(store)
+
+      Connect.shutdown(tenant.external_id)
 
       assert_receive {:DOWN, ^ref, :process, ^store, _reason}, 2000
     end
@@ -140,9 +173,9 @@ defmodule Realtime.Tenants.TempStateStoreTest do
       assert {:error, :unavailable} = TempStateStore.put(store, "k", %{})
     end
 
-    test "two channels get isolated state", %{tenant: tenant, db_conn: db_conn} do
-      {:ok, store_a} = TempStateStore.start(tenant, self(), "room:" <> random_string(), db_conn)
-      {:ok, store_b} = TempStateStore.start(tenant, self(), "room:" <> random_string(), db_conn)
+    test "two channels get isolated state", %{tenant: tenant} do
+      {:ok, store_a} = TempStateStore.start(tenant, self(), "room:" <> random_string())
+      {:ok, store_b} = TempStateStore.start(tenant, self(), "room:" <> random_string())
 
       assert {:ok, 1} = TempStateStore.put(store_a, "k", %{"who" => "a"})
       assert {:error, :not_found} = TempStateStore.get(store_b, "k")

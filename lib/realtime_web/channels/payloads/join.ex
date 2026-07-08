@@ -46,10 +46,12 @@ defmodule RealtimeWeb.Channels.Payloads.Join do
   def self_broadcast?(%__MODULE__{config: %Config{broadcast: %Broadcast{self: self}}}), do: self
   def self_broadcast?(_), do: false
 
-  def private?(%__MODULE__{config: %Config{private: private}}), do: private
+  # `== true` and not the bare field: an explicit JSON null survives Ecto cast as nil
+  # (field defaults only apply to absent keys), and these values feed strict boolean operators.
+  def private?(%__MODULE__{config: %Config{private: private}}), do: private == true
   def private?(_), do: false
 
-  def state_enabled?(%__MODULE__{config: %Config{state: %State{enabled: enabled}}}), do: enabled
+  def state_enabled?(%__MODULE__{config: %Config{state: %State{enabled: enabled}}}), do: enabled == true
   def state_enabled?(_), do: false
 
   def error_message(_field, meta) do

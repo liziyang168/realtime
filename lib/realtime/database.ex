@@ -124,8 +124,12 @@ defmodule Realtime.Database do
       with {:ok, base_settings} <- from_settings(settings, "realtime_connect", :stop),
            check_settings = %{base_settings | max_restarts: 0},
            {:ok, conn} <- connect_db(check_settings),
-           {:ok, [available_connections, migrations_ran]} <- query_connection_info(conn) do
-        requirement = ceil(required_pool * @available_connection_factor)
+           {:ok, [available_connections, max_connections, migrations_ran]} <- query_connection_info(conn) do
+        # Temp state store sessions (dedicated, per-channel) are not part of any pool, so their
+        # cap is reserved explicitly on top of the pooled requirements.
+        requirement =
+          ceil(required_pool * @available_connection_factor) +
+            Realtime.Tenants.TempStateStore.capacity_limit(max_connections)
 
         if requirement < available_connections do
           {:ok, conn, migrations_ran}
@@ -152,19 +156,20 @@ defmodule Realtime.Database do
   """
 
   @connections_query """
-  SELECT (current_setting('max_connections')::int - count(*))::int
+  SELECT (current_setting('max_connections')::int - count(*))::int,
+         current_setting('max_connections')::int
   FROM pg_stat_activity
   WHERE application_name != 'realtime_connect'
   """
 
   defp query_connection_info(conn) do
-    %{rows: [[available_connections]]} = Postgrex.query!(conn, @connections_query, [])
+    %{rows: [[available_connections, max_connections]]} = Postgrex.query!(conn, @connections_query, [])
     %{rows: [[table_exists]]} = Postgrex.query!(conn, @migrations_table_exists_query, [])
 
     %{rows: [[migrations_ran]]} =
       if table_exists, do: Postgrex.query!(conn, @migrations_count_query, []), else: %{rows: [[0]]}
 
-    {:ok, [available_connections, migrations_ran]}
+    {:ok, [available_connections, max_connections, migrations_ran]}
   rescue
     e ->
       GenServer.stop(conn)

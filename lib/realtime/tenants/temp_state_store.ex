@@ -6,7 +6,9 @@ defmodule Realtime.Tenants.TempStateStore do
   (`config.state.enabled = true`) and a dedicated process is started for that channel. It is only
   honoured on private (authenticated) channels because it opens a dedicated session against the
   tenant database; allowing it on public channels would let anyone spin up sessions and write to
-  the tenant database.
+  the tenant database. Note that beyond the private-channel gate there is no per-feature
+  authorization: any user allowed to join the private channel gets full access to their own
+  store (state is per-connection scratch space, never shared across users).
 
   ## Ownership model
 
@@ -20,21 +22,37 @@ defmodule Realtime.Tenants.TempStateStore do
   two independent stores, connections and temp tables. This is per-connection scratch space, not
   shared state broadcast to a topic's subscribers.
 
-  On connect the session is configured and the `TEMP TABLE` is created via Postgrex's
-  `:after_connect` hook. The connection uses `backoff_type: :stop`, so a dropped connection is not
-  retried: the store stops instead and the channel re-creates one on its next join if it still
-  wants state. The temp table therefore tracks the lifetime of a single session.
+  `start/3` returns as soon as the store process is registered; the database connection, session
+  setup and `TEMP TABLE` creation happen asynchronously in a `handle_continue` so channel joins
+  never block on the tenant database and a slow tenant cannot stall the shared supervisor.
+  Commands sent before setup completes simply queue behind it. If the connection cannot be
+  established (or the capacity check below fails) the store stops; the channel monitors the
+  store and notifies the client that state is unavailable.
+
+  The connection uses `backoff_type: :stop`, so a dropped connection is not retried: the store
+  stops instead and the channel re-creates one on its next join if it still wants state. The
+  store also monitors the tenant's `Realtime.Tenants.Connect` process and stops when it goes
+  down, so tenant-level teardown (rebalancing, database settings changes) also closes these
+  sessions instead of leaving them behind. The temp table therefore tracks the lifetime of a
+  single session.
 
   ## Per-tenant limit
 
   Because each store holds a dedicated tenant-database session, the number of live stores is
-  capped. The cap is driven by the database itself rather than by Realtime bookkeeping: before
-  starting a store, `start/4` counts the live `realtime_temp_state` sessions in the tenant
-  database (`pg_stat_activity`) and compares them against a fraction of that database's
-  `max_connections` (and the `max_per_tenant/0` ceiling). This is authoritative and naturally
-  cluster-wide — every node's sessions appear in `pg_stat_activity` — so it guarantees the limit
-  tracks real database capacity. `start/4` returns `{:error, :too_many_state_stores}` once the
-  limit is reached; the channel treats that as "no store" and joins without one.
+  capped in two layers, both bounded by `capacity_limit/1` (`min(max_per_tenant(),
+  max_connection_fraction() * max_connections)`):
+
+    * a node-local gate: store starts are serialized through the DynamicSupervisor and counted
+      in `Realtime.Registry`, so on a single node the cap is exact and `start/3` returns
+      `{:error, :too_many_state_stores}` synchronously;
+    * a cluster-wide backstop: after connecting, the store counts the live
+      `realtime_temp_state` sessions in the tenant database (`pg_stat_activity`, which includes
+      its own session) and stops itself if the limit is exceeded.
+
+  The backstop is check-after-connect rather than check-then-act, so a cross-node burst can
+  transiently open more sessions than the cap, but the surplus stores terminate themselves and
+  the steady state converges to the limit. This capacity is also reserved in
+  `Realtime.Database.check_tenant_connection/1` so tenant provisioning accounts for it.
 
   Because the table is a `TEMP TABLE` it lives in `pg_temp` and is therefore:
 
@@ -44,17 +62,20 @@ defmodule Realtime.Tenants.TempStateStore do
 
   The supported SQL surface is intentionally tiny and only ever touches the channel's own
   temp table by primary key: `put`, `insert`, `update`, `delete`, `get`, `clear` and `count`.
-  No joins, no sorts, no aggregation beyond a single `count(*)` health check, and no access to
-  any other table.
+  No joins, no sorts, no aggregation beyond the `count(*)` health check, and no access to
+  any other table. Values are bound as JSON text and cast server-side (`::text::jsonb`), so
+  they are stored as real jsonb documents and the size limit measures exactly what is stored.
 
   ## Input limits
 
   To keep unbounded data out of the tenant's temp space, writes are bounded in the application:
 
-    * keys larger than 1024 bytes are rejected (`:key_too_large`)
-    * values larger than `max_value_bytes/0` are rejected (`:value_too_large`)
+    * keys must be strings of at most 1024 bytes (`:invalid_key` / `:key_too_large`)
+    * values larger than `max_value_bytes/0` (JSON-encoded) are rejected (`:value_too_large`)
     * a store holds at most `max_keys/0` keys; a new key past that returns `:limit_reached`
-      (updates to existing keys are still allowed)
+      (updates to existing keys are still allowed). The key count is tracked in the owner
+      process — exact, because all mutations are serialized through it — so writes pay no
+      extra SQL for limit enforcement.
 
   These are enforced regardless of the session guardrails below, which cannot be fully relied on.
 
@@ -71,6 +92,7 @@ defmodule Realtime.Tenants.TempStateStore do
 
   alias Realtime.Api.Tenant
   alias Realtime.Database
+  alias Realtime.Tenants.Connect
 
   @application_name "realtime_temp_state"
   @default_max_per_tenant 10
@@ -79,10 +101,18 @@ defmodule Realtime.Tenants.TempStateStore do
   @default_max_keys 10_000
   @max_key_bytes 1024
 
+  # Query timeout for every statement; the GenServer.call timeout must exceed it so a slow
+  # query is reported as its real outcome instead of a caller timeout for a write that
+  # actually committed.
+  @query_timeout 15_000
+  @call_timeout @query_timeout + 5_000
+  @idle_interval 30_000
+
+  # Runs on the store's own session, so the count includes this session.
   @capacity_query """
-  SELECT
-    (SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND datname = current_database()),
-    current_setting('max_connections')::int
+  SELECT count(*), current_setting('max_connections')::int
+  FROM pg_stat_activity
+  WHERE application_name = $1 AND datname = current_database()
   """
 
   @session_settings [
@@ -94,16 +124,7 @@ defmodule Realtime.Tenants.TempStateStore do
   @type version :: non_neg_integer()
   @type expected :: version() | nil
 
-  @type command ::
-          {:put, key :: String.t(), value :: term()}
-          | {:insert, key :: String.t(), value :: term()}
-          | {:update, key :: String.t(), value :: term(), expected()}
-          | {:delete, key :: String.t(), expected()}
-          | {:get, key :: String.t()}
-          | :clear
-          | :count
-
-  defstruct [:conn, :table, :channel_name, :monitored_pid]
+  defstruct [:tenant, :conn, :table, :monitored_pid, :channel_ref, :connect_ref, key_count: 0]
 
   ## Public API
 
@@ -111,28 +132,19 @@ defmodule Realtime.Tenants.TempStateStore do
   Starts a temp state store for a channel under the dedicated DynamicSupervisor.
 
   `monitored_pid` is the channel process: when it goes down the store stops and the session
-  (and therefore the temp table) is torn down. `db_conn` is the tenant's shared connection, used
-  to read live capacity from the database before opening a new session.
+  (and therefore the temp table) is torn down. Returns `{:error, :too_many_state_stores}` when
+  the node-local cap is already reached; the database connection itself is established
+  asynchronously after this returns.
   """
-  @spec start(Tenant.t(), pid(), String.t(), pid()) :: {:ok, pid()} | {:error, term()}
-  def start(%Tenant{} = tenant, monitored_pid, channel_name, db_conn) do
-    with :ok <- within_capacity(db_conn) do
-      opts = [tenant: tenant, monitored_pid: monitored_pid, channel_name: channel_name]
-      DynamicSupervisor.start_child(__MODULE__.DynamicSupervisor, {__MODULE__, opts})
-    end
+  @spec start(Tenant.t(), pid(), String.t()) :: {:ok, pid()} | {:error, term()}
+  def start(%Tenant{} = tenant, monitored_pid, channel_name) do
+    opts = [tenant: tenant, monitored_pid: monitored_pid, channel_name: channel_name]
+    DynamicSupervisor.start_child(__MODULE__.DynamicSupervisor, {__MODULE__, opts})
   end
 
-  defp within_capacity(db_conn) do
-    case Postgrex.query(db_conn, @capacity_query, [@application_name]) do
-      {:ok, %{rows: [[used, max_connections]]}} ->
-        if used >= capacity_limit(max_connections), do: {:error, :too_many_state_stores}, else: :ok
-
-      {:error, _} ->
-        {:error, :cap_check_failed}
-    end
-  end
-
-  defp capacity_limit(max_connections) do
+  @doc "Effective cap on live stores for a database with the given `max_connections`."
+  @spec capacity_limit(pos_integer()) :: pos_integer()
+  def capacity_limit(max_connections) do
     from_database = max(1, floor(max_connections * max_connection_fraction()))
     min(max_per_tenant(), from_database)
   end
@@ -205,48 +217,94 @@ defmodule Realtime.Tenants.TempStateStore do
   def count(pid), do: call(pid, :count)
 
   defp call(pid, command) do
-    GenServer.call(pid, {:command, command})
+    GenServer.call(pid, {:command, command}, @call_timeout)
   catch
     :exit, _ -> {:error, :unavailable}
   end
 
   ## GenServer callbacks
 
+  # init stays IO-free so store starts never block the shared DynamicSupervisor: it only
+  # applies the node-local cap (exact, because starts are serialized through the supervisor
+  # and registrations are cleaned up on process death) and registers monitors. The database
+  # work happens in handle_continue.
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
     tenant = Keyword.fetch!(opts, :tenant)
     monitored_pid = Keyword.fetch!(opts, :monitored_pid)
     channel_name = Keyword.fetch!(opts, :channel_name)
-    table = table_name(channel_name)
 
     Logger.metadata(external_id: tenant.external_id, project: tenant.external_id)
 
+    registry_key = {__MODULE__, tenant.external_id}
+
+    if Registry.count_match(Realtime.Registry, registry_key, :_) >= max_per_tenant() do
+      {:stop, :too_many_state_stores}
+    else
+      {:ok, _} = Registry.register(Realtime.Registry, registry_key, nil)
+      channel_ref = Process.monitor(monitored_pid)
+
+      state = %__MODULE__{
+        tenant: tenant,
+        table: table_name(channel_name),
+        monitored_pid: monitored_pid,
+        channel_ref: channel_ref
+      }
+
+      {:ok, state, {:continue, :connect}}
+    end
+  end
+
+  @impl true
+  def handle_continue(:connect, %{tenant: tenant, table: table} = state) do
     case connect(tenant, table) do
       {:ok, conn} ->
-        Process.monitor(monitored_pid)
+        # conn goes into state before the capacity check so terminate/2 closes the session
+        # on every failure path from here on.
+        state = %{state | conn: conn, tenant: nil}
 
-        {:ok,
-         %__MODULE__{
-           conn: conn,
-           table: table,
-           channel_name: channel_name,
-           monitored_pid: monitored_pid
-         }}
+        case within_capacity(conn) do
+          :ok ->
+            # Tie the session to the tenant's Connect lifecycle so tenant-level teardown
+            # (rebalancing, db settings changes) also closes it. Lenient when Connect is not
+            # registered (e.g. unit tests exercising the store directly).
+            connect_ref =
+              case Connect.whereis(tenant.external_id) do
+                pid when is_pid(pid) -> Process.monitor(pid)
+                _ -> nil
+              end
+
+            {:noreply, %{state | connect_ref: connect_ref}}
+
+          {:error, :too_many_state_stores} ->
+            log_warning("TempStateStoreLimitReached", "Per-tenant temp state store limit reached")
+            {:stop, :normal, state}
+
+          {:error, error} ->
+            log_error("TempStateStoreConnectionError", error)
+            {:stop, :normal, state}
+        end
 
       {:error, error} ->
         log_error("TempStateStoreConnectionError", error)
-        {:stop, :normal}
+        {:stop, :normal, state}
     end
   end
 
   @impl true
   def handle_call({:command, command}, _from, state) do
-    {:reply, run(command, state), state}
+    {reply, state} = run(command, state)
+    {:reply, reply, state}
   end
 
   @impl true
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{monitored_pid: pid} = state) do
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{channel_ref: ref} = state) do
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{connect_ref: ref} = state) do
+    Logger.info("Tenant connection process terminated, stopping temp state store")
     {:stop, :normal, state}
   end
 
@@ -266,140 +324,168 @@ defmodule Realtime.Tenants.TempStateStore do
   def terminate(_reason, _state), do: :ok
 
   ## Commands
+  #
+  # Every clause returns {reply, state}. key_count is exact: this process serializes all
+  # mutations, so counting inserted/deleted keys app-side replaces a count(*) scan per write.
 
-  defp run({:put, key, value}, %{conn: conn, table: table}) do
-    sql = """
-    INSERT INTO #{table} (key, value)
-    SELECT $1, $2::jsonb
-    WHERE (SELECT count(*) FROM #{table}) < $3
-       OR EXISTS (SELECT 1 FROM #{table} WHERE key = $1)
-    ON CONFLICT (key)
-    DO UPDATE SET value = EXCLUDED.value,
-                  version = #{table}.version + 1,
-                  updated_at = clock_timestamp()
-    RETURNING version
-    """
-
-    with {:ok, value} <- encode_and_validate(key, value),
-         {:ok, result} <- query(conn, sql, [key, value, max_keys()]) do
-      case result do
-        %{rows: [[version]]} -> {:ok, version}
-        %{num_rows: 0} -> {:error, :limit_reached}
-      end
-    end
-  end
-
-  defp run({:insert, key, value}, %{conn: conn, table: table}) do
-    sql = """
-    INSERT INTO #{table} (key, value)
-    SELECT $1, $2::jsonb
-    WHERE (SELECT count(*) FROM #{table}) < $3
-       OR EXISTS (SELECT 1 FROM #{table} WHERE key = $1)
-    RETURNING version
-    """
-
+  defp run({:put, key, value}, %{conn: conn, table: table, key_count: key_count} = state) do
     with {:ok, value} <- encode_and_validate(key, value) do
-      case query(conn, sql, [key, value, max_keys()]) do
-        {:ok, %{rows: [[version]]}} -> {:ok, version}
-        {:ok, %{num_rows: 0}} -> {:error, :limit_reached}
-        {:error, %Postgrex.Error{postgres: %{code: :unique_violation}}} -> {:error, :already_exists}
-        {:error, _} = error -> error
+      if key_count < max_keys() do
+        sql = """
+        INSERT INTO #{table} (key, value)
+        VALUES ($1, $2::text::jsonb)
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value,
+                      version = #{table}.version + 1,
+                      updated_at = clock_timestamp()
+        RETURNING version
+        """
+
+        case query(conn, sql, [key, value]) do
+          # version 1 can only come from a fresh insert; conflicting rows always bump past it
+          {:ok, %{rows: [[1]]}} -> {{:ok, 1}, %{state | key_count: key_count + 1}}
+          {:ok, %{rows: [[version]]}} -> {{:ok, version}, state}
+          {:error, _} = error -> {error, state}
+        end
+      else
+        # At the key cap only updates to existing keys are allowed
+        case update_row(conn, table, key, value, nil) do
+          {:ok, %{rows: [[version]]}} -> {{:ok, version}, state}
+          {:ok, %{num_rows: 0}} -> {{:error, :limit_reached}, state}
+          {:error, _} = error -> {error, state}
+        end
       end
+    else
+      error -> {error, state}
     end
   end
 
-  defp run({:update, key, value, expected}, %{conn: conn, table: table}) do
-    {sql, params_tail} =
-      case expected do
-        nil ->
-          {"UPDATE #{table} SET value = $2::jsonb, version = version + 1, updated_at = clock_timestamp() WHERE key = $1 RETURNING version",
-           []}
-
-        version ->
-          {"UPDATE #{table} SET value = $2::jsonb, version = version + 1, updated_at = clock_timestamp() WHERE key = $1 AND version = $3 RETURNING version",
-           [version]}
-      end
-
+  defp run({:insert, key, value}, %{conn: conn, table: table, key_count: key_count} = state) do
     with {:ok, value} <- encode_and_validate(key, value) do
-      case query(conn, sql, [key, value | params_tail]) do
-        {:ok, %{rows: [[version]]}} -> {:ok, version}
-        {:ok, %{num_rows: 0}} when is_nil(expected) -> {:error, :not_found}
-        {:ok, %{num_rows: 0}} -> version_conflict(conn, table, key)
-        {:error, _} = error -> error
+      if key_count < max_keys() do
+        sql = "INSERT INTO #{table} (key, value) VALUES ($1, $2::text::jsonb) RETURNING version"
+
+        case query(conn, sql, [key, value]) do
+          {:ok, %{rows: [[version]]}} -> {{:ok, version}, %{state | key_count: key_count + 1}}
+          {:error, %Postgrex.Error{postgres: %{code: :unique_violation}}} -> {{:error, :already_exists}, state}
+          {:error, _} = error -> {error, state}
+        end
+      else
+        {{:error, :limit_reached}, state}
       end
+    else
+      error -> {error, state}
     end
   end
 
-  defp run({:delete, key, expected}, %{conn: conn, table: table}) do
-    {sql, params} =
-      case expected do
-        nil -> {"DELETE FROM #{table} WHERE key = $1", [key]}
-        version -> {"DELETE FROM #{table} WHERE key = $1 AND version = $2", [key, version]}
+  defp run({:update, key, value, expected}, %{conn: conn, table: table} = state) do
+    with {:ok, value} <- encode_and_validate(key, value) do
+      case update_row(conn, table, key, value, expected) do
+        {:ok, %{rows: [[version]]}} -> {{:ok, version}, state}
+        {:ok, %{num_rows: 0}} when is_nil(expected) -> {{:error, :not_found}, state}
+        {:ok, %{num_rows: 0}} -> {version_conflict(conn, table, key), state}
+        {:error, _} = error -> {error, state}
       end
-
-    case query(conn, sql, params) do
-      {:ok, %{num_rows: 0}} when is_nil(expected) -> {:error, :not_found}
-      {:ok, %{num_rows: 0}} -> version_conflict(conn, table, key)
-      {:ok, _} -> {:ok, :deleted}
-      {:error, _} = error -> error
+    else
+      error -> {error, state}
     end
   end
 
-  defp run({:get, key}, %{conn: conn, table: table}) do
-    sql = "SELECT value, version, updated_at FROM #{table} WHERE key = $1"
+  defp run({:delete, key, expected}, %{conn: conn, table: table, key_count: key_count} = state) do
+    with :ok <- validate_key(key) do
+      {sql, params} =
+        case expected do
+          nil -> {"DELETE FROM #{table} WHERE key = $1", [key]}
+          version -> {"DELETE FROM #{table} WHERE key = $1 AND version = $2", [key, version]}
+        end
 
-    case query(conn, sql, [key]) do
-      {:ok, %{rows: [[value, version, updated_at]]}} ->
-        {:ok, %{value: decode(value), version: version, updated_at: updated_at}}
-
-      {:ok, %{num_rows: 0}} ->
-        {:error, :not_found}
-
-      {:error, _} = error ->
-        error
+      case query(conn, sql, params) do
+        {:ok, %{num_rows: 0}} when is_nil(expected) -> {{:error, :not_found}, state}
+        {:ok, %{num_rows: 0}} -> {version_conflict(conn, table, key), state}
+        {:ok, _} -> {{:ok, :deleted}, %{state | key_count: max(key_count - 1, 0)}}
+        {:error, _} = error -> {error, state}
+      end
+    else
+      error -> {error, state}
     end
   end
 
-  defp run(:clear, %{conn: conn, table: table}) do
+  defp run({:get, key}, %{conn: conn, table: table} = state) do
+    with :ok <- validate_key(key) do
+      sql = "SELECT value, version, updated_at FROM #{table} WHERE key = $1"
+
+      case query(conn, sql, [key]) do
+        {:ok, %{rows: [[value, version, updated_at]]}} ->
+          {{:ok, %{value: value, version: version, updated_at: updated_at}}, state}
+
+        {:ok, %{num_rows: 0}} ->
+          {{:error, :not_found}, state}
+
+        {:error, _} = error ->
+          {error, state}
+      end
+    else
+      error -> {error, state}
+    end
+  end
+
+  defp run(:clear, %{conn: conn, table: table} = state) do
     case query(conn, "TRUNCATE #{table}", []) do
-      {:ok, _} -> :ok
-      {:error, _} = error -> error
+      {:ok, _} -> {:ok, %{state | key_count: 0}}
+      {:error, _} = error -> {error, state}
     end
   end
 
-  defp run(:count, %{conn: conn, table: table}) do
+  defp run(:count, %{conn: conn, table: table} = state) do
     case query(conn, "SELECT count(*) FROM #{table}", []) do
-      {:ok, %{rows: [[count]]}} -> {:ok, count}
-      {:error, _} = error -> error
+      {:ok, %{rows: [[count]]}} -> {{:ok, count}, state}
+      {:error, _} = error -> {error, state}
     end
   end
 
   ## Private
 
+  defp update_row(conn, table, key, value, expected) do
+    {sql_tail, params_tail} =
+      case expected do
+        nil -> {"", []}
+        version -> {" AND version = $3", [version]}
+      end
+
+    sql = """
+    UPDATE #{table}
+    SET value = $2::text::jsonb, version = version + 1, updated_at = clock_timestamp()
+    WHERE key = $1#{sql_tail}
+    RETURNING version
+    """
+
+    query(conn, sql, [key, value | params_tail])
+  end
+
   defp query(conn, sql, params) do
-    Postgrex.query(conn, sql, params)
+    Postgrex.query(conn, sql, params, timeout: @query_timeout)
   end
 
   defp encode_and_validate(key, value) do
-    cond do
-      byte_size(key) > @max_key_bytes ->
-        {:error, :key_too_large}
-
-      true ->
-        with {:ok, encoded} <- encode(value) do
-          if byte_size(encoded) > max_value_bytes(), do: {:error, :value_too_large}, else: {:ok, encoded}
-        end
+    with :ok <- validate_key(key),
+         {:ok, encoded} <- encode(value) do
+      if byte_size(encoded) > max_value_bytes(), do: {:error, :value_too_large}, else: {:ok, encoded}
     end
   end
 
-  defp encode(value) do
-    {:ok, Jason.encode!(value)}
-  rescue
-    error -> {:error, error}
-  end
+  defp validate_key(key) when is_binary(key) and byte_size(key) <= @max_key_bytes, do: :ok
+  defp validate_key(key) when is_binary(key), do: {:error, :key_too_large}
+  defp validate_key(_key), do: {:error, :invalid_key}
 
-  defp decode(value) when is_binary(value), do: Jason.decode!(value)
-  defp decode(value), do: value
+  defp encode(value) do
+    case Jason.encode(value) do
+      {:ok, encoded} -> {:ok, encoded}
+      {:error, _} -> {:error, :invalid_value}
+    end
+  rescue
+    # Jason raises Protocol.UndefinedError for unencodable structs
+    _ -> {:error, :invalid_value}
+  end
 
   defp version_conflict(conn, table, key) do
     case query(conn, "SELECT version FROM #{table} WHERE key = $1", [key]) do
@@ -409,35 +495,36 @@ defmodule Realtime.Tenants.TempStateStore do
     end
   end
 
-  defp connect(tenant, table) do
-    with {:ok, settings} <- Database.from_tenant(tenant, @application_name, :stop),
-         {:ok, conn} <-
-           Postgrex.start_link(
-             hostname: settings.hostname,
-             port: settings.port,
-             database: settings.database,
-             username: settings.username,
-             password: settings.password,
-             pool_size: 1,
-             parameters: [application_name: @application_name],
-             socket_options: settings.socket_options,
-             ssl: settings.ssl,
-             backoff_type: :stop,
-             after_connect: {__MODULE__, :setup_session, [table]}
-           ),
-         {:ok, _} <- ready(conn) do
-      {:ok, conn}
+  # The capacity query doubles as the readiness check: it blocks until the connection is
+  # established (or fails), and its result enforces the cluster-wide cap from the session's
+  # own point of view — the count includes this session, so strictly greater means over cap.
+  defp within_capacity(conn) do
+    case Postgrex.query(conn, @capacity_query, [@application_name], timeout: @query_timeout) do
+      {:ok, %{rows: [[used, max_connections]]}} ->
+        if used > capacity_limit(max_connections), do: {:error, :too_many_state_stores}, else: :ok
+
+      {:error, _} = error ->
+        error
     end
   end
 
-  defp ready(conn) do
-    case Postgrex.query(conn, "SELECT 1", []) do
-      {:ok, _} = ok ->
-        ok
-
-      {:error, _} = error ->
-        Process.exit(conn, :shutdown)
-        error
+  defp connect(tenant, table) do
+    with {:ok, settings} <- Database.from_tenant(tenant, @application_name, :stop) do
+      Postgrex.start_link(
+        hostname: settings.hostname,
+        port: settings.port,
+        database: settings.database,
+        username: settings.username,
+        password: settings.password,
+        pool_size: 1,
+        queue_target: settings.queue_target,
+        idle_interval: @idle_interval,
+        parameters: [application_name: @application_name],
+        socket_options: settings.socket_options,
+        ssl: settings.ssl,
+        backoff_type: :stop,
+        after_connect: {__MODULE__, :setup_session, [table]}
+      )
     end
   end
 

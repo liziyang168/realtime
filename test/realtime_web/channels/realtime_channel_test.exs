@@ -1726,6 +1726,40 @@ defmodule RealtimeWeb.RealtimeChannelTest do
       ref = push(socket, "state", %{"command" => "update", "key" => "k", "value" => %{"a" => 2}, "expected" => "1"})
       assert_receive %Socket.Reply{ref: ^ref, status: :error, payload: %{reason: "invalid_expected"}}, 2000
     end
+
+    test "treats a null expected version as last-write-wins", %{tenant: tenant} do
+      socket = join_state_socket(tenant)
+
+      ref = push(socket, "state", %{"command" => "put", "key" => "k", "value" => %{"a" => 1}})
+      assert_receive %Socket.Reply{ref: ^ref, status: :ok}, 2000
+
+      ref = push(socket, "state", %{"command" => "update", "key" => "k", "value" => %{"a" => 2}, "expected" => nil})
+      assert_receive %Socket.Reply{ref: ^ref, status: :ok, payload: %{version: 2}}, 2000
+    end
+
+    test "rejects a non-string key without touching the store", %{tenant: tenant} do
+      socket = join_state_socket(tenant)
+      store = socket.assigns.temp_state_store
+
+      ref = push(socket, "state", %{"command" => "put", "key" => 123, "value" => %{"a" => 1}})
+      assert_receive %Socket.Reply{ref: ^ref, status: :error, payload: %{reason: "invalid_state_command"}}, 2000
+
+      ref = push(socket, "state", %{"command" => "get", "key" => 123})
+      assert_receive %Socket.Reply{ref: ^ref, status: :error, payload: %{reason: "invalid_state_command"}}, 2000
+
+      # the store must have survived the malformed commands
+      assert Process.alive?(store)
+    end
+
+    test "a null enabled flag joins without a store instead of erroring", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
+
+      assert {:ok, _, %Socket{} = socket} =
+               subscribe_and_join(socket, "realtime:test", %{config: %{private: true, state: %{enabled: nil}}})
+
+      assert socket.assigns.temp_state_store == nil
+    end
   end
 
   defp join_state_socket(tenant) do

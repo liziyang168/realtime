@@ -324,6 +324,17 @@ defmodule RealtimeWeb.Channels.Payloads.JoinTest do
       assert Join.state_enabled?(%Join{config: %Config{state: %State{enabled: true}}})
     end
 
+    test "treats an explicit null enabled as false" do
+      # a JSON null survives Ecto cast as nil; state_enabled? must still return a boolean
+      assert {:ok, join} = Join.validate(%{"config" => %{"state" => %{"enabled" => nil}}})
+      assert Join.state_enabled?(join) == false
+    end
+
+    test "private? treats an explicit null as false" do
+      assert {:ok, join} = Join.validate(%{"config" => %{"private" => nil}})
+      assert Join.private?(join) == false
+    end
+
     test "defaults to false when state config is nil" do
       refute Join.state_enabled?(%Join{config: %Config{state: nil}})
     end

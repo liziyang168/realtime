@@ -78,14 +78,15 @@ defmodule Realtime.DatabaseTest do
       GenServer.stop(conn)
     end
 
-    # Connection limit for docker tenant db is 100
+    # Connection limit for docker tenant db is 100; requirement includes the temp state store
+    # reservation (capacity_limit(100) = 10) on top of the pooled requirements.
     @tag db_pool: 50,
          subs_pool_size: 73
     test "restricts connection if tenant database cannot receive more connections based on tenant pool",
          %{tenant: tenant} do
       assert capture_log(fn ->
                assert {:error, :tenant_db_too_many_connections} = Database.check_tenant_connection(tenant)
-             end) =~ ~r/Only \d+ available connections\. At least 125 connections are required/
+             end) =~ ~r/Only \d+ available connections\. At least 135 connections are required/
     end
   end
 

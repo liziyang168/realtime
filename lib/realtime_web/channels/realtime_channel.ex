@@ -149,7 +149,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         tenant_topic: tenant_topic,
         channel_name: sub_topic,
         presence_enabled?: presence_enabled?,
-        temp_state_store: maybe_start_temp_state_store(join, tenant, sub_topic, socket, db_conn)
+        temp_state_store: maybe_start_temp_state_store(join, tenant, sub_topic, socket)
       }
 
       assigns =
@@ -351,7 +351,7 @@ defmodule RealtimeWeb.RealtimeChannel do
       channel_name
     )
 
-    {:noreply, socket}
+    {:noreply, assign(socket, :temp_state_store, nil)}
   end
 
   def handle_info(_msg, %{assigns: %{policies: %Policies{broadcast: %BroadcastPolicies{read: false}}}} = socket) do
@@ -560,6 +560,7 @@ defmodule RealtimeWeb.RealtimeChannel do
   end
 
   def handle_in("state", _payload, socket) do
+    count(socket)
     {:reply, {:error, %{reason: "State store is not enabled for this channel"}}, socket}
   end
 
@@ -1034,29 +1035,32 @@ defmodule RealtimeWeb.RealtimeChannel do
   defp maybe_replay_messages(_, _, _, _, _), do: {:ok, MapSet.new()}
 
   # Maps the constrained client command protocol onto a single TempStateStore operation.
-  defp handle_state_command(store, %{"command" => "put", "key" => key, "value" => value}) do
+  # Keys must be strings: a non-binary key falls through to :invalid_state_command instead of
+  # reaching the store, where it could only fail.
+  defp handle_state_command(store, %{"command" => "put", "key" => key, "value" => value}) when is_binary(key) do
     with {:ok, version} <- TempStateStore.put(store, key, value), do: {:ok, %{version: version}}
   end
 
-  defp handle_state_command(store, %{"command" => "insert", "key" => key, "value" => value}) do
+  defp handle_state_command(store, %{"command" => "insert", "key" => key, "value" => value}) when is_binary(key) do
     with {:ok, version} <- TempStateStore.insert(store, key, value), do: {:ok, %{version: version}}
   end
 
-  defp handle_state_command(store, %{"command" => "update", "key" => key, "value" => value} = payload) do
+  defp handle_state_command(store, %{"command" => "update", "key" => key, "value" => value} = payload)
+       when is_binary(key) do
     with {:ok, expected} <- expected_version(payload),
          {:ok, version} <- TempStateStore.update(store, key, value, expected) do
       {:ok, %{version: version}}
     end
   end
 
-  defp handle_state_command(store, %{"command" => "delete", "key" => key} = payload) do
+  defp handle_state_command(store, %{"command" => "delete", "key" => key} = payload) when is_binary(key) do
     with {:ok, expected} <- expected_version(payload),
          {:ok, :deleted} <- TempStateStore.delete(store, key, expected) do
       {:ok, %{deleted: true}}
     end
   end
 
-  defp handle_state_command(store, %{"command" => "get", "key" => key}) do
+  defp handle_state_command(store, %{"command" => "get", "key" => key}) when is_binary(key) do
     TempStateStore.get(store, key)
   end
 
@@ -1066,9 +1070,11 @@ defmodule RealtimeWeb.RealtimeChannel do
 
   defp handle_state_command(_store, _payload), do: {:error, :invalid_state_command}
 
+  # JSON null for the optional expected version means the same as omitting it.
   defp expected_version(payload) do
     case Map.fetch(payload, "expected") do
       :error -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
       {:ok, version} when is_integer(version) -> {:ok, version}
       {:ok, _} -> {:error, :invalid_expected}
     end
@@ -1081,8 +1087,10 @@ defmodule RealtimeWeb.RealtimeChannel do
   # to the tenant database. On a public channel the request is ignored with a warning.
   #
   # Best-effort otherwise: a failure to start the dedicated session must not prevent the channel
-  # from joining, so we log and continue without a store rather than failing the join.
-  defp maybe_start_temp_state_store(join, tenant, sub_topic, socket, db_conn) do
+  # from joining, so we log and continue without a store rather than failing the join. The store
+  # connects asynchronously; if the connection (or the cluster-wide capacity backstop) fails
+  # after this returns, the monitor below fires and the client is notified via a system message.
+  defp maybe_start_temp_state_store(join, tenant, sub_topic, socket) do
     cond do
       not Join.state_enabled?(join) ->
         nil
@@ -1092,7 +1100,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         nil
 
       true ->
-        case TempStateStore.start(tenant, self(), sub_topic, db_conn) do
+        case TempStateStore.start(tenant, self(), sub_topic) do
           {:ok, pid} ->
             Process.monitor(pid)
             pid
