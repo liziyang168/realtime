@@ -463,7 +463,7 @@ defmodule RealtimeWeb.RealtimeChannel do
   end
 
   def handle_in("broadcast", payload, %{assigns: %{private?: false}} = socket) do
-    BroadcastHandler.handle(payload, socket)
+    BroadcastHandler.handle(payload, nil, socket)
   end
 
   def handle_in("presence", payload, %{assigns: %{private?: true}} = socket) do

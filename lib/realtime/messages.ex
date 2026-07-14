@@ -4,11 +4,68 @@ defmodule Realtime.Messages do
   """
 
   alias Realtime.Api.Message
+  alias Realtime.Channels
+  alias Realtime.Tenants.Connect
+  alias Realtime.Tenants.Repo
 
   import Ecto.Query, only: [from: 2]
 
   @hard_limit 25
   @default_timeout 5_000
+
+  @doc """
+  Persists a broadcast sent over WebSocket for `topic` if storage is enabled for such topic.
+
+  Bypass RLS because the check has already been done on the message broadcast,
+  and then set `broadcasted_at` to avoid re-broadcasting the message twice.
+
+  Automatically uses RPC if the database connection is not on the same node.
+  """
+  @spec store(DBConnection.conn(), String.t(), String.t(), String.t(), term(), boolean()) ::
+          {:ok, binary()} | {:error, any()} | {:error, :rpc_error, term} | {:error, :storage_disabled}
+  def store(conn, tenant_id, topic, event, payload, private) when node(conn) == node() do
+    if Channels.storage_enabled?(conn, tenant_id, topic) do
+      insert(conn, topic, event, payload, private)
+    else
+      {:error, :storage_disabled}
+    end
+  end
+
+  def store(conn, tenant_id, topic, event, payload, private) do
+    Realtime.GenRpc.call(node(conn), __MODULE__, :store, [conn, tenant_id, topic, event, payload, private], key: topic)
+  end
+
+  @doc """
+  Similar to `store/6` but runs asynchronously for callers that don't already hold a connection.
+  """
+  @spec store_async(String.t(), String.t(), String.t(), term()) :: :ok
+  def store_async(tenant_id, topic, event, payload) do
+    Task.Supervisor.start_child(Realtime.TaskSupervisor, fn ->
+      case Connect.lookup_or_start_connection(tenant_id) do
+        {:ok, conn} -> store(conn, tenant_id, topic, event, payload, false)
+        {:error, _reason} -> :skip
+      end
+    end)
+
+    :ok
+  end
+
+  defp insert(conn, topic, event, payload, private) do
+    changeset =
+      Message.changeset(%Message{}, %{
+        topic: topic,
+        extension: :broadcast,
+        event: event,
+        payload: payload,
+        private: private,
+        broadcasted_at: NaiveDateTime.utc_now(:microsecond)
+      })
+
+    case Repo.insert(conn, changeset, Message) do
+      {:ok, %Message{id: id}} -> {:ok, id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   @doc """
   Fetch last `limit ` messages for a given `topic` inserted after `since`

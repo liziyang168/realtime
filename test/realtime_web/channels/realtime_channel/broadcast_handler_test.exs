@@ -9,18 +9,20 @@ defmodule RealtimeWeb.RealtimeChannel.BroadcastHandlerTest do
   import ExUnit.CaptureLog
 
   alias Ecto.UUID
+  alias Realtime.Api.Message
   alias Realtime.RateCounter
   alias Realtime.Tenants
   alias Realtime.Tenants.Authorization
   alias Realtime.Tenants.Authorization.Policies
   alias Realtime.Tenants.Authorization.Policies.BroadcastPolicies
   alias Realtime.Tenants.Connect
+  alias Realtime.Tenants.Repo
   alias RealtimeWeb.Endpoint
   alias RealtimeWeb.RealtimeChannel.BroadcastHandler
 
   setup [:initiate_tenant]
 
-  @payload %{"a" => "b"}
+  @payload %{"event" => "test", "payload" => %{"a" => "b"}}
 
   describe "handle/3" do
     test "with write true policy, user is able to send message",
@@ -452,6 +454,83 @@ defmodule RealtimeWeb.RealtimeChannel.BroadcastHandlerTest do
                )
 
       refute_receive {:socket_push, :text, _}, 120
+    end
+  end
+
+  describe "broadcast storage" do
+    test "private channel with storage enabled stores the message and acks with its id", %{
+      topic: topic,
+      tenant: tenant,
+      db_conn: db_conn
+    } do
+      enable_broadcast_storage(db_conn, tenant, topic)
+      socket = socket_fixture(tenant, topic, policies: %Policies{broadcast: %BroadcastPolicies{write: true}})
+
+      assert {:reply, {:ok, %{id: id}}, _socket} = BroadcastHandler.handle(@payload, db_conn, socket)
+      expected_payload = @payload["payload"]
+
+      assert {:ok,
+              [
+                %Message{
+                  id: ^id,
+                  topic: ^topic,
+                  event: "test",
+                  private: true,
+                  payload: ^expected_payload,
+                  broadcasted_at: %NaiveDateTime{}
+                }
+              ]} = Repo.all(db_conn, Message, Message)
+    end
+
+    test "private channel without storage enabled acks without storing anything", %{
+      topic: topic,
+      tenant: tenant,
+      db_conn: db_conn
+    } do
+      socket = socket_fixture(tenant, topic, policies: %Policies{broadcast: %BroadcastPolicies{write: true}})
+
+      assert {:reply, :ok, _socket} = BroadcastHandler.handle(@payload, db_conn, socket)
+
+      assert {:ok, []} = Repo.all(db_conn, Message, Message)
+    end
+
+    test "public channel with storage enabled stores the message asynchronously and still acks plainly", %{
+      topic: topic,
+      tenant: tenant,
+      db_conn: db_conn
+    } do
+      enable_broadcast_storage(db_conn, tenant, topic)
+      socket = socket_fixture(tenant, topic, private?: false, policies: nil)
+
+      # Storage for public channels is fire-and-forget, so the ack never carries an id.
+      assert {:reply, :ok, _socket} = BroadcastHandler.handle(@payload, nil, socket)
+
+      assert eventually(fn -> match?({:ok, [_]}, Repo.all(db_conn, Message, Message)) end)
+      assert {:ok, [%Message{private: false, broadcasted_at: %NaiveDateTime{}}]} = Repo.all(db_conn, Message, Message)
+    end
+
+    test "public channel without a database connection still broadcasts and acks", %{
+      topic: topic,
+      tenant: tenant
+    } do
+      socket = socket_fixture(tenant, topic, private?: false, policies: nil)
+
+      assert {:reply, :ok, _socket} = BroadcastHandler.handle(@payload, nil, socket)
+    end
+
+    test "disabling storage stops new messages from being stored", %{
+      topic: topic,
+      tenant: tenant,
+      db_conn: db_conn
+    } do
+      enable_broadcast_storage(db_conn, tenant, topic)
+      socket = socket_fixture(tenant, topic, policies: %Policies{broadcast: %BroadcastPolicies{write: true}})
+      assert {:reply, {:ok, %{id: _id}}, socket} = BroadcastHandler.handle(@payload, db_conn, socket)
+
+      disable_broadcast_storage(db_conn, tenant, topic)
+
+      assert {:reply, :ok, _socket} = BroadcastHandler.handle(@payload, db_conn, socket)
+      assert {:ok, [_only_one]} = Repo.all(db_conn, Message, Message)
     end
   end
 

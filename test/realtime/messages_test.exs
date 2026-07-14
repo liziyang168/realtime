@@ -27,6 +27,46 @@ defmodule Realtime.MessagesTest do
     %{conn: conn, tenant: tenant, date_start: date_start, date_end: date_end}
   end
 
+  describe "store/6" do
+    test "inserts a message marked as already broadcast", %{conn: conn, tenant: tenant} do
+      topic = random_string()
+      enable_broadcast_storage(conn, tenant, topic)
+
+      assert {:ok, id} = Messages.store(conn, tenant.external_id, topic, "test", %{"a" => "b"}, true)
+
+      assert {:ok,
+              [
+                %Message{
+                  id: ^id,
+                  topic: ^topic,
+                  extension: :broadcast,
+                  private: true,
+                  broadcasted_at: %NaiveDateTime{}
+                }
+              ]} = Repo.all(conn, Message, Message)
+    end
+
+    test "skips when broadcast storage isn't enabled for the topic", %{conn: conn, tenant: tenant} do
+      topic = random_string()
+
+      assert Messages.store(conn, tenant.external_id, topic, "test", %{"a" => "b"}, true) == {:error, :storage_disabled}
+      assert {:ok, []} = Repo.all(conn, Message, Message)
+    end
+
+    test "distributed store", %{conn: conn, tenant: tenant} do
+      topic = random_string()
+      enable_broadcast_storage(conn, tenant, topic)
+
+      {:ok, node} = Clustered.start()
+
+      # Call remote node passing the database connection that is local to this node
+      assert {:ok, id} =
+               :erpc.call(node, Messages, :store, [conn, tenant.external_id, topic, "test", %{"a" => "b"}, true])
+
+      assert {:ok, [%Message{id: ^id, topic: ^topic}]} = Repo.all(conn, Message, Message)
+    end
+  end
+
   describe "replay/5" do
     test "invalid replay params", %{tenant: tenant} do
       assert Messages.replay(self(), tenant.external_id, "a topic", "not a number", 123) ==

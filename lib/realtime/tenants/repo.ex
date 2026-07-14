@@ -107,11 +107,11 @@ defmodule Realtime.Tenants.Repo do
   end
 
   defp result_to_single_struct(
-         {:error, %Postgrex.Error{postgres: %{code: :unique_violation, constraint: "channels_name_index"}}},
+         {:error, %Postgrex.Error{postgres: %{code: :unique_violation, constraint: "channels_topic_index"}}},
          _struct,
          changeset
        ) do
-    Ecto.Changeset.add_error(changeset, :name, "has already been taken")
+    Ecto.Changeset.add_error(changeset, :topic, "has already been taken")
   end
 
   defp result_to_single_struct({:error, _} = error, _, _), do: error
