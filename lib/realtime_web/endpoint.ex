@@ -42,6 +42,10 @@ defmodule RealtimeWeb.Endpoint do
 
   socket "/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]]
 
+  # Tags Logger metadata with external_id/project before anything else runs, so it's
+  # present on the very first request log line (Plug.Telemetry's start event below).
+  plug RealtimeWeb.Plugs.TenantLogMetadata
+
   # Serve at "/" the static files from "priv/static" directory.
   #
   # You should set gzip to true if you are running phx.digest
