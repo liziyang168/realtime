@@ -1,187 +1,107 @@
-defmodule Realtime.Tenants.Migrations.AddPostgrestFilterOps do
+defmodule Realtime.Tenants.Migrations.RevertPostgrestFilterOps do
   @moduledoc """
-  Adds PostgREST-parity filter operators (`like`, `ilike`, `is`, `match`, `imatch`,
-  `isdistinct`) plus a `negate` flag (PostgREST `not.`) to the single
-  `realtime.subscription.filters` column.
+  Additive revert of `AddPostgrestFilterOps` (20260616120000). We never edit shipped migrations,
+  so this restores the walrus functions to their pre-20260616120000 definitions, drops the
+  `negate` attribute added to `realtime.user_defined_filter`, and drops the 5-arg
+  `check_equality_op` overload.
 
-  `realtime.user_defined_filter` gains a trailing `negate boolean` attribute so every operator
-  (legacy and new) lives in one column; there is no separate `filters_v2`. `check_equality_op`
-  gains a `negate`-aware overload that maps each operator to the right SQL operator, and
-  `is_visible_through_filters` / `subscription_check_filters` / `apply_rls` are redefined to use
-  it.
+  The new `equality_op` enum values (`like`, `ilike`, `is`, `match`, `imatch`, `isdistinct`)
+  cannot be removed in Postgres, so they remain; the reverted client no longer emits them.
 
-  `realtime.subscription` is ephemeral (clients re-create their subscriptions on reconnect), so
-  the table is truncated before the type is altered — that keeps the in-place arity change of
-  `user_defined_filter` safe (no existing 3-field rows to rewrite).
+  `realtime.subscription` is ephemeral (clients re-create their subscriptions on reconnect), so it
+  is truncated before the type is altered back to its 3-field shape.
   """
 
   use Ecto.Migration
 
   def change do
-    # New equality operators. Additive; idempotent so the migration can be re-run.
-    execute("alter type realtime.equality_op add value if not exists 'like';")
-    execute("alter type realtime.equality_op add value if not exists 'ilike';")
-    execute("alter type realtime.equality_op add value if not exists 'is';")
-    execute("alter type realtime.equality_op add value if not exists 'match';")
-    execute("alter type realtime.equality_op add value if not exists 'imatch';")
-    execute("alter type realtime.equality_op add value if not exists 'isdistinct';")
-
-    # Subscriptions are ephemeral. Clearing the table first means the arity change below has no
-    # existing rows to rewrite and no old 3-field literals can linger.
+    # Subscriptions are ephemeral. Clearing the table first keeps the type arity change below safe.
     execute("truncate realtime.subscription;")
 
-    execute("""
-    do $$
-    begin
-        if exists (select 1 from pg_extension where extname = 'orioledb') then
-            execute 'drop index if exists realtime.subscription_subscription_id_entity_filters_action_filter_selected_columns_key';
-        end if;
-    end $$;
-    """)
-
-    # Add `negate` to the single filter type. No IF NOT EXISTS for ADD ATTRIBUTE, so guard on
-    # pg_attribute. CASCADE because the type backs the `filters` column.
-    execute("""
-    do $$
-    begin
-        if not exists (
-            select 1
-            from pg_type ty
-            join pg_class c on c.oid = ty.typrelid
-            join pg_attribute a on a.attrelid = c.oid
-            join pg_namespace n on n.oid = ty.typnamespace
-            where n.nspname = 'realtime'
-              and ty.typname = 'user_defined_filter'
-              and a.attname = 'negate'
-              and not a.attisdropped
-        ) then
-            alter type realtime.user_defined_filter add attribute negate boolean cascade;
-        end if;
-    end $$;
-    """)
-
-    execute("""
-    do $$
-    begin
-        if exists (select 1 from pg_extension where extname = 'orioledb') then
-            execute 'create unique index if not exists subscription_subscription_id_entity_filters_action_filter_selected_columns_key on realtime.subscription (subscription_id, entity, filters, action_filter, coalesce(selected_columns, ''{}''))';
-        end if;
-    end $$;
-    """)
-
-    # negate-aware overload (5-arg). Maps every operator to the right SQL operator and applies
-    # negation. The 5-arg signature is distinct from the original 4-arg one, so existing callers
-    # are unaffected.
+    # Restore the original 4-arg check_equality_op (20230128025114). Untouched by the filter ops
+    # migration, but recreated explicitly so the function matches the pre-revert source.
     execute("""
     create or replace function realtime.check_equality_op(
         op realtime.equality_op,
         type_ regtype,
         val_1 text,
-        val_2 text,
-        negate boolean
+        val_2 text
     )
         returns bool
-        stable  -- uses EXECUTE, so cannot be immutable
+        immutable
         language plpgsql
     as $$
+    /*
+    Casts *val_1* and *val_2* as type *type_* and check the *op* condition for truthiness
+    */
     declare
-        op_symbol text;
+        op_symbol text = (
+            case
+                when op = 'eq' then '='
+                when op = 'neq' then '!='
+                when op = 'lt' then '<'
+                when op = 'lte' then '<='
+                when op = 'gt' then '>'
+                when op = 'gte' then '>='
+                when op = 'in' then '= any'
+                else 'UNKNOWN OP'
+            end
+        );
         res boolean;
     begin
-        -- IS DISTINCT FROM / IS NOT DISTINCT FROM: infix, both sides typed literals
-        if op = 'isdistinct' then
-            execute format(
-                'select %L::%s %s %L::%s',
-                val_1,
-                type_::text,
-                case when negate then 'IS NOT DISTINCT FROM' else 'IS DISTINCT FROM' end,
-                val_2,
-                type_::text
-            ) into res;
-            return res;
-        end if;
-
-        -- IS requires a keyword RHS (NULL, TRUE, FALSE, UNKNOWN), not a typed literal
-        if op = 'is' then
-            if val_2 not in ('null', 'true', 'false', 'unknown') then
-                raise exception 'invalid value for is filter: must be null, true, false, or unknown';
-            end if;
-            execute format(
-                'select %L::%s %s %s',
-                val_1,
-                type_::text,
-                case when negate then 'IS NOT' else 'IS' end,
-                upper(val_2)
-            ) into res;
-            return res;
-        end if;
-
-        op_symbol = case
-            when op = 'eq'    then '='
-            when op = 'neq'   then '!='
-            when op = 'lt'    then '<'
-            when op = 'lte'   then '<='
-            when op = 'gt'    then '>'
-            when op = 'gte'   then '>='
-            when op = 'in'    then '= any'
-            when op = 'like'   then 'LIKE'
-            when op = 'ilike'  then 'ILIKE'
-            when op = 'match'  then '~'
-            when op = 'imatch' then '~*'
-            else null
-        end;
-
-        if op_symbol is null then
-            raise exception 'unsupported equality operator: %', op::text;
-        end if;
-
         execute format(
-            'select %L::%s %s (%L::%s)',
-            val_1,
-            type_::text,
-            op_symbol,
-            val_2,
-            case when op = 'in' then type_::text || '[]' else type_::text end
-        ) into res;
-
-        return case when negate then not res else res end;
+            'select %L::'|| type_::text || ' ' || op_symbol
+            || ' ( %L::'
+            || (
+                case
+                    when op = 'in' then type_::text || '[]'
+                    else type_::text end
+            )
+            || ')', val_1, val_2) into res;
+        return res;
     end;
     $$;
     """)
 
-    # Evaluate a record against the (now negate-carrying) filters. Fail closed: every filter must
-    # match a column present in the WAL payload, otherwise an unevaluable filter defaults to
-    # visible.
+    # Restore is_visible_through_filters (20220908172859): inner join, bool_and, 4-arg
+    # check_equality_op, no negate.
     execute("""
     create or replace function realtime.is_visible_through_filters(columns realtime.wal_column[], filters realtime.user_defined_filter[])
-        returns bool
-        language sql
-        stable  -- calls a stable function, so cannot be immutable
+      returns bool
+      language sql
+      immutable
     as $$
+    /*
+    Should the record be visible (true) or filtered out (false) after *filters* are applied
+    */
         select
-            filters is null
-            or array_length(filters, 1) is null
-            or coalesce(
-                count(col.name) = count(1)
-                and sum(
+            -- Default to allowed when no filters present
+            $2 is null -- no filters. this should not happen because subscriptions has a default
+            or array_length($2, 1) is null -- array length of an empty array is null
+            or bool_and(
+                coalesce(
                     realtime.check_equality_op(
                         op:=f.op,
-                        type_:=coalesce(col.type_oid::regtype, col.type_name::regtype),
+                        type_:=coalesce(
+                            col.type_oid::regtype, -- null when wal2json version <= 2.4
+                            col.type_name::regtype
+                        ),
+                        -- cast jsonb to text
                         val_1:=col.value #>> '{}',
-                        val_2:=f.value,
-                        negate:=coalesce(f.negate, false)
-                    )::int
-                ) filter (where col.name is not null) = count(col.name),
-                false
+                        val_2:=f.value
+                    ),
+                    false -- if null, filter does not match
+                )
             )
         from
             unnest(filters) f
-            left join unnest(columns) col
+            join unnest(columns) col
                 on f.column_name = col.name;
     $$;
     """)
 
-    # Validate and normalize the single filters column, including the new operators.
+    # Restore subscription_check_filters (20260606110000): pg_attribute based, no new operators,
+    # filters ordered without negate.
     execute("""
     create or replace function realtime.subscription_check_filters()
         returns trigger
@@ -229,48 +149,7 @@ defmodule Realtime.Tenants.Migrations.AddPostgrestFilterOps do
                 if coalesce(jsonb_array_length(in_val), 0) > 100 then
                     raise exception 'too many values for `in` filter. Maximum 100';
                 end if;
-            elsif filter.op = 'is'::realtime.equality_op then
-                -- `is` requires a keyword RHS rather than a typed literal
-                if filter.value not in ('null', 'true', 'false', 'unknown') then
-                    raise exception 'invalid value for is filter: must be null, true, false, or unknown';
-                end if;
-                -- IS NULL works for any type, but IS TRUE/FALSE/UNKNOWN require a boolean
-                -- operand. Reject the non-null keywords on non-boolean columns here so they
-                -- don't abort apply_rls at WAL time.
-                if filter.value <> 'null' and col_type <> 'boolean'::regtype then
-                    raise exception 'is % filter requires a boolean column, got %', filter.value, col_type::text;
-                end if;
-            elsif filter.op in ('like'::realtime.equality_op, 'ilike'::realtime.equality_op) then
-                -- like/ilike apply the text pattern operator (~~); reject column types that
-                -- have no such operator instead of failing at WAL time
-                if not exists (
-                    select 1 from pg_catalog.pg_operator
-                    where oprname = '~~' and oprleft = col_type
-                ) then
-                    raise exception 'operator % requires a text-compatible column type, got %', filter.op::text, col_type::text;
-                end if;
-            elsif filter.op in ('match'::realtime.equality_op, 'imatch'::realtime.equality_op) then
-                -- match/imatch apply the regex operators ~ / ~*; reject column types that have
-                -- no such operator (e.g. integer) instead of failing at WAL time, mirroring the
-                -- like/ilike guard above.
-                if not exists (
-                    select 1 from pg_catalog.pg_operator
-                    where oprname = case when filter.op = 'imatch'::realtime.equality_op then '~*' else '~' end
-                      and oprleft = col_type
-                      and oprright = col_type
-                      and oprresult = 'boolean'::regtype
-                ) then
-                    raise exception 'operator % requires a text-compatible column type, got %', filter.op::text, col_type::text;
-                end if;
-                -- validate the regex eagerly so a bad pattern is rejected here, not inside
-                -- apply_rls where it would abort the WAL stream for the entity
-                begin
-                    perform '' ~ filter.value;
-                exception when others then
-                    raise exception 'invalid regular expression for % filter: %', filter.op::text, sqlerrm;
-                end;
             else
-                -- eq/neq/lt/lte/gt/gte: value must be coercable to the type
                 perform realtime.cast(filter.value, col_type);
             end if;
         end loop;
@@ -283,10 +162,8 @@ defmodule Realtime.Tenants.Migrations.AddPostgrestFilterOps do
             end loop;
         end if;
 
-        -- Apply consistent order to filters so the unique constraint can't be tricked by a
-        -- different filter order. negate is part of the sort key.
         new.filters = coalesce(
-            array_agg(f order by f.column_name, f.op, f.value, f.negate),
+            array_agg(f order by f.column_name, f.op, f.value),
             '{}'
         ) from unnest(new.filters) f;
 
@@ -300,7 +177,7 @@ defmodule Realtime.Tenants.Migrations.AddPostgrestFilterOps do
     $$;
     """)
 
-    # apply_rls re-defined so the visibility check uses the single filters column.
+    # Restore apply_rls (20260527120000): uses is_visible_through_filters without negate.
     execute("""
     create or replace function realtime.apply_rls(wal jsonb, max_record_bytes int = 1024 * 1024)
         returns setof realtime.wal_rls
@@ -663,26 +540,44 @@ defmodule Realtime.Tenants.Migrations.AddPostgrestFilterOps do
     $$;
     """)
 
-    # The 5-arg check_equality_op is a new signature, so align its owner with the existing 4-arg
-    # overload to keep the realtime schema single-owner under the least-privilege setup.
+    # Drop the negate-aware 5-arg overload added by the filter ops migration.
+    execute("drop function if exists realtime.check_equality_op(realtime.equality_op, regtype, text, text, boolean);")
+
     execute("""
     do $$
-    declare
-        target_owner text;
     begin
-        select r.rolname into target_owner
-        from pg_proc p
-        join pg_namespace n on n.oid = p.pronamespace
-        join pg_roles r on r.oid = p.proowner
-        where n.nspname = 'realtime'
-          and p.proname = 'check_equality_op'
-          and p.pronargs = 4;
+        if exists (select 1 from pg_extension where extname = 'orioledb') then
+            execute 'drop index if exists realtime.subscription_subscription_id_entity_filters_action_filter_selected_columns_key';
+        end if;
+    end $$;
+    """)
 
-        if target_owner is not null then
-            execute format(
-                'alter function realtime.check_equality_op(realtime.equality_op, regtype, text, text, boolean) owner to %I',
-                target_owner
-            );
+    # Drop the `negate` attribute so realtime.user_defined_filter is back to 3 fields. Guard on
+    # pg_attribute for idempotency. CASCADE because the type backs the `filters` column.
+    execute("""
+    do $$
+    begin
+        if exists (
+            select 1
+            from pg_type ty
+            join pg_class c on c.oid = ty.typrelid
+            join pg_attribute a on a.attrelid = c.oid
+            join pg_namespace n on n.oid = ty.typnamespace
+            where n.nspname = 'realtime'
+              and ty.typname = 'user_defined_filter'
+              and a.attname = 'negate'
+              and not a.attisdropped
+        ) then
+            alter type realtime.user_defined_filter drop attribute negate cascade;
+        end if;
+    end $$;
+    """)
+
+    execute("""
+    do $$
+    begin
+        if exists (select 1 from pg_extension where extname = 'orioledb') then
+            execute 'create unique index if not exists subscription_subscription_id_entity_filters_action_filter_selected_columns_key on realtime.subscription (subscription_id, entity, filters, action_filter, coalesce(selected_columns, ''{}''))';
         end if;
     end $$;
     """)

@@ -65,13 +65,31 @@ defmodule RealtimeWeb.Dashboard.TenantMigrationsTest do
     assert has_element?(view, "p.text-danger", "Tenant not found")
   end
 
-  test "renders pg-delta section header when tenant is found", %{conn: conn, tenant: tenant} do
+  test "renders pg-delta section header with the resolved catalog major version", %{conn: conn, tenant: tenant} do
+    {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
+
+    %{rows: [[version]]} =
+      Postgrex.query!(db_conn, "SELECT current_setting('server_version_num')::int / 10000", [])
+
+    expected_major = if version >= 17, do: 17, else: 15
+
     {:ok, view, _html} = live(conn, "/admin/dashboard/tenant_migrations?external_id=#{tenant.external_id}")
 
-    assert has_element?(view, "h6", "pg-delta plan vs catalog")
+    assert has_element?(view, "h6", "pg-delta plan vs catalog (PG#{expected_major})")
   end
 
-  describe "backfill_schema_migrations/1" do
+  test "shows 0 rows instead of an error when realtime.schema_migrations is missing", %{conn: conn, tenant: tenant} do
+    {:ok, settings} = Database.from_tenant(tenant, "realtime_test", :stop)
+    {:ok, admin_conn} = Database.connect_db(%{settings | username: "supabase_admin", pool_size: 1})
+    Postgrex.query!(admin_conn, "DROP TABLE realtime.schema_migrations", [])
+
+    {:ok, view, _html} = live(conn, "/admin/dashboard/tenant_migrations?external_id=#{tenant.external_id}")
+
+    assert has_element?(view, "p.text-muted.small.mb-2", "0")
+    refute has_element?(view, "p.text-danger")
+  end
+
+  describe "apply_pgdelta/2 with nil sql (backfill)" do
     test "inserts missing versions and updates tenants.migrations_ran", %{tenant: tenant} do
       {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
 
@@ -83,7 +101,7 @@ defmodule RealtimeWeb.Dashboard.TenantMigrationsTest do
 
       {:ok, _} = Api.update_migrations_ran(tenant.external_id, 7)
 
-      assert :ok = TenantMigrations.backfill_schema_migrations(tenant)
+      assert :ok = TenantMigrations.apply_pgdelta(tenant, nil)
 
       %{rows: [[count]]} =
         Postgrex.query!(db_conn, "SELECT count(*)::int FROM realtime.schema_migrations", [])
@@ -99,8 +117,8 @@ defmodule RealtimeWeb.Dashboard.TenantMigrationsTest do
       {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
       total = length(Migrations.migrations())
 
-      assert :ok = TenantMigrations.backfill_schema_migrations(tenant)
-      assert :ok = TenantMigrations.backfill_schema_migrations(tenant)
+      assert :ok = TenantMigrations.apply_pgdelta(tenant, nil)
+      assert :ok = TenantMigrations.apply_pgdelta(tenant, nil)
 
       %{rows: [[count]]} =
         Postgrex.query!(db_conn, "SELECT count(*)::int FROM realtime.schema_migrations", [])
@@ -112,7 +130,7 @@ defmodule RealtimeWeb.Dashboard.TenantMigrationsTest do
     end
   end
 
-  describe "apply_pg_delta/2" do
+  describe "apply_pgdelta/2" do
     test "runs the sql plan and backfills schema_migrations", %{tenant: tenant} do
       {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
 
@@ -124,7 +142,7 @@ defmodule RealtimeWeb.Dashboard.TenantMigrationsTest do
 
       {:ok, _} = Api.update_migrations_ran(tenant.external_id, 7)
 
-      assert :ok = TenantMigrations.apply_pg_delta(tenant, "SELECT 1")
+      assert :ok = TenantMigrations.apply_pgdelta(tenant, "SELECT 1")
 
       %{rows: [[count]]} =
         Postgrex.query!(db_conn, "SELECT count(*)::int FROM realtime.schema_migrations", [])

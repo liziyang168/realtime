@@ -1,14 +1,17 @@
-defmodule Realtime.Tenants.Migrations.AddPostgrestFilterOps do
+defmodule Realtime.Tenants.Migrations.ReAddPostgrestFilterOps do
   @moduledoc """
-  Adds PostgREST-parity filter operators (`like`, `ilike`, `is`, `match`, `imatch`,
-  `isdistinct`) plus a `negate` flag (PostgREST `not.`) to the single
-  `realtime.subscription.filters` column.
+  Additive re-apply of `AddPostgrestFilterOps` (20260616120000) after it was rolled back by
+  `RevertPostgrestFilterOps` (20260624120000). Migrations are append-only, so instead of removing
+  the revert we add this migration to bring the PostgREST-parity filter operators back.
 
-  `realtime.user_defined_filter` gains a trailing `negate boolean` attribute so every operator
-  (legacy and new) lives in one column; there is no separate `filters_v2`. `check_equality_op`
-  gains a `negate`-aware overload that maps each operator to the right SQL operator, and
-  `is_visible_through_filters` / `subscription_check_filters` / `apply_rls` are redefined to use
-  it.
+  Re-adds the `like`, `ilike`, `is`, `match`, `imatch`, `isdistinct` operators plus the `negate`
+  flag (PostgREST `not.`) on `realtime.user_defined_filter`, recreates the negate-aware 5-arg
+  `check_equality_op`, and redefines `is_visible_through_filters` / `subscription_check_filters` /
+  `apply_rls` to use them.
+
+  The body mirrors `AddPostgrestFilterOps` verbatim: it is idempotent (enum values use
+  `if not exists`, the `negate` attribute is guarded on `pg_attribute`, functions use
+  `create or replace`) so it applies cleanly whether or not the revert ran on a given tenant.
 
   `realtime.subscription` is ephemeral (clients re-create their subscriptions on reconnect), so
   the table is truncated before the type is altered — that keeps the in-place arity change of

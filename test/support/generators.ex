@@ -23,8 +23,6 @@ defmodule Generators do
             "db_name" => "postgres",
             "db_user" => System.get_env("DB_USER", "supabase_admin"),
             "db_password" => "postgres",
-            "db_user_realtime" => System.get_env("DB_USER_REALTIME", "supabase_realtime_admin"),
-            "db_pass_realtime" => "postgres",
             "db_port" => "#{override[:port] || port()}",
             "poll_interval_ms" => 10,
             "poll_max_changes" => 100,
@@ -276,6 +274,19 @@ defmodule Generators do
     ON realtime.messages FOR INSERT
     TO authenticated
     WITH CHECK ( realtime.topic() = '#{name}' AND realtime.messages.extension IN ('presence', 'broadcast') );
+    """
+  end
+
+  def policy_query(:authenticated_read_presence_based_on_claim, %{topic: name}) do
+    """
+    CREATE POLICY "authenticated_read_presence_claim_#{name}"
+    ON realtime.messages FOR SELECT
+    TO authenticated
+    USING (
+      realtime.topic() = '#{name}'
+      AND realtime.messages.extension = 'presence'
+      AND coalesce(((current_setting('request.jwt.claims', true))::jsonb ->> 'presence_read')::boolean, false)
+    );
     """
   end
 

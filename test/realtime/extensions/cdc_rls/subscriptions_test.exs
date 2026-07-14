@@ -676,6 +676,95 @@ defmodule Realtime.Extensions.PostgresCdcRls.SubscriptionsTest do
                Subscriptions.create(conn, "supabase_realtime_test", params_list, self(), self())
     end
 
+    test "create succeeds when the connection cached a stale user_defined_filter arity", %{conn: conn, tenant: tenant} do
+      # Regression for ErrorOnRpcCall :badarg when a Postgrex connection holds a stale composite
+      # arity for realtime.user_defined_filter.
+      #
+      # Postgrex caches a composite's field list per connection at bootstrap and never refreshes
+      # it when ALTER TYPE changes the type. After ReAddPostgrestFilterOps the type carries a 4th
+      # `negate` attribute, but a connection that bootstrapped before the re-add still caches the
+      # 3-field arity. Building the filter row server-side (in the INSERT) instead of binding a
+      # composite tuple keeps the arity resolved by the server's current catalog, so the insert
+      # must still succeed on such a connection.
+      #
+      # We reproduce the stale cache by dropping the attribute, opening a fresh connection (which
+      # caches 3 fields), then adding it back to 4 fields before inserting.
+      {:ok, admin_settings} = Database.from_tenant(tenant, "realtime_test", :stop)
+
+      {:ok, admin_conn} =
+        Postgrex.start_link(
+          hostname: admin_settings.hostname,
+          port: admin_settings.port,
+          database: admin_settings.database,
+          username: "supabase_admin",
+          password: admin_settings.password
+        )
+
+      # OrioleDB can't ALTER TYPE a type an index depends on.
+      %Postgrex.Result{rows: [[index_name, index_def]]} =
+        Postgrex.query!(
+          admin_conn,
+          """
+          SELECT i.indexrelid::regclass::text, pg_get_indexdef(i.indexrelid)
+          FROM pg_index i
+          WHERE i.indrelid = 'realtime.subscription'::regclass
+            AND EXISTS (
+              SELECT 1 FROM pg_attribute a
+              WHERE a.attrelid = i.indrelid AND a.attname = 'filters' AND a.attnum = ANY(i.indkey)
+            )
+          """,
+          []
+        )
+
+      Postgrex.query!(admin_conn, "DROP INDEX IF EXISTS #{index_name}", [])
+
+      Postgrex.query!(
+        admin_conn,
+        "alter type realtime.user_defined_filter drop attribute negate cascade",
+        []
+      )
+
+      {:ok, stale_conn} =
+        admin_settings
+        |> Map.from_struct()
+        |> Keyword.new()
+        |> Postgrex.start_link()
+
+      # Postgrex loads a composite type's field info lazily on first encode/decode, so force the
+      # fresh connection to cache the 3-field arity by decoding a 3-field value now.
+      Postgrex.query!(stale_conn, "select row('x', 'eq', 'y')::realtime.user_defined_filter", [])
+
+      Postgrex.query!(
+        admin_conn,
+        "alter type realtime.user_defined_filter add attribute negate boolean cascade",
+        []
+      )
+
+      Postgrex.query!(admin_conn, index_def, [])
+
+      {:ok, subscription_params} =
+        Subscriptions.parse_subscription_params(%{
+          "schema" => "public",
+          "table" => "test",
+          "filter" => "id=eq.123"
+        })
+
+      params_list = [%{claims: %{"role" => "anon"}, id: UUID.uuid1(), subscription_params: subscription_params}]
+
+      assert {:ok, [%Postgrex.Result{}]} =
+               Subscriptions.create(stale_conn, "supabase_realtime_test", params_list, self(), self())
+
+      # Read filters back as text: the shared Postgrex type cache still holds the stale 3-field
+      # composite decoder, so casting to text avoids decoding through it while still proving the
+      # row was inserted with the right 4-field filter (negate defaults to false → f).
+      assert %Postgrex.Result{rows: [["test", ~s|{"(id,eq,123,f)"}|, "*"]]} =
+               Postgrex.query!(
+                 conn,
+                 "select entity::text, filters::text, action_filter from realtime.subscription",
+                 []
+               )
+    end
+
     test "user can subscribe to only INSERT events", %{conn: conn} do
       {:ok, subscription_params} =
         Subscriptions.parse_subscription_params(%{"event" => "INSERT", "schema" => "public"})
@@ -712,7 +801,6 @@ defmodule Realtime.Extensions.PostgresCdcRls.SubscriptionsTest do
     test "create works for a table whose name contains a backslash", %{conn: conn} do
       Postgrex.query!(conn, ~s|CREATE TABLE "my\\table" (id int)|, [])
       Postgrex.query!(conn, ~s|GRANT ALL ON "my\\table" TO anon|, [])
-      Postgrex.query!(conn, ~s|ALTER PUBLICATION supabase_realtime_test ADD TABLE "my\\table"|, [])
 
       {:ok, subscription_params} =
         Subscriptions.parse_subscription_params(%{"schema" => "public", "table" => "my\\table"})
@@ -1185,7 +1273,72 @@ defmodule Realtime.Extensions.PostgresCdcRls.SubscriptionsTest do
     end
   end
 
-  defp create_subscriptions(conn, num) do
+  describe "regression tests" do
+    test "list_changes succeeds for custom roles without execution grants (issue #2001 with non-builtin role)",
+         %{conn: conn, tenant: tenant} do
+      {:ok, admin_settings} = Database.from_tenant(tenant, "realtime_test", :stop)
+
+      {:ok, admin_conn} =
+        Postgrex.start_link(
+          hostname: admin_settings.hostname,
+          port: admin_settings.port,
+          database: admin_settings.database,
+          username: "supabase_admin",
+          password: admin_settings.password
+        )
+
+      Postgrex.query!(
+        admin_conn,
+        "revoke execute on function realtime.check_equality_op(realtime.equality_op, regtype, text, text, boolean) from public",
+        []
+      )
+
+      Postgrex.query(admin_conn, "drop role if exists custom_app_role", [])
+      Postgrex.query!(admin_conn, "create role custom_app_role nologin", [])
+      Postgrex.query!(admin_conn, "grant custom_app_role to supabase_realtime_admin", [])
+      Postgrex.query!(admin_conn, "grant all on table public.test to custom_app_role", [])
+      Postgrex.query!(admin_conn, "alter table public.test enable row level security", [])
+
+      Postgrex.query!(
+        admin_conn,
+        "create policy custom_app_role_all on public.test for all to custom_app_role using (true)",
+        []
+      )
+
+      {:ok, subscription_params} =
+        Subscriptions.parse_subscription_params(%{
+          "schema" => "public",
+          "table" => "test",
+          "filter" => "id=eq.1"
+        })
+
+      # create 11 subscriptions to force the pre-fetch cursor (FOR loop) behaviour in apply_rls function
+      assert {:ok, _} =
+               create_subscriptions(conn, 11, role: "custom_app_role", subscription_params: subscription_params)
+
+      slot_name = "test_custom_role_grant_#{:rand.uniform(999_999)}"
+      Postgrex.query!(conn, "SELECT pg_create_logical_replication_slot($1, 'wal2json')", [slot_name])
+
+      Postgrex.query!(conn, "insert into test (id, details) values (1, 'hello')", [])
+
+      assert {:ok, %Postgrex.Result{rows: rows}} =
+               Postgrex.query(
+                 conn,
+                 "select wal, subscription_ids from realtime.list_changes($1, $2, 100, 1048576)",
+                 ["supabase_realtime_test", slot_name]
+               )
+
+      sub_ids = rows |> Enum.flat_map(fn [_wal, sub_ids] -> sub_ids end)
+      assert length(sub_ids) == 11
+
+      Postgrex.query(conn, "SELECT pg_drop_replication_slot($1)", [slot_name])
+    end
+  end
+
+  defp create_subscriptions(conn, num, opts \\ []) do
+    role = Keyword.get(opts, :role, "anon")
+    subscription_params = Keyword.get(opts, :subscription_params, {"*", "public", "*", [], nil})
+
     params_list =
       Enum.reduce(1..num, [], fn _i, acc ->
         [
@@ -1195,10 +1348,10 @@ defmodule Realtime.Extensions.PostgresCdcRls.SubscriptionsTest do
               "iat" => 1_658_600_791,
               "iss" => "supabase",
               "ref" => "127.0.0.1",
-              "role" => "anon"
+              "role" => role
             },
             id: UUID.uuid1(),
-            subscription_params: {"*", "public", "*", [], nil}
+            subscription_params: subscription_params
           }
           | acc
         ]
