@@ -91,6 +91,10 @@ jobs:
       - name: Start Postgres
         run: docker compose -f compose.dbs.yml up -d --wait
 
+      # Force re-generating fresh dump and catalogs
+      - name: Remove committed db dump
+        run: rm -f priv/repo/tenant_db_dump_${{ matrix.pg_major }}.sql
+
       - name: Set up realtime DB and migrate tenant DB
         run: mix ecto.setup
 
