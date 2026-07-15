@@ -32,8 +32,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pg_major: 14
-            postgres_image: supabase/postgres:14.1.0.82
           - pg_major: 15
             postgres_image: supabase/postgres:15.14.1.129
           - pg_major: 17
@@ -97,7 +95,6 @@ jobs:
         run: mix ecto.setup
 
       - name: Export Tenant DB catalog
-        if: matrix.pg_major != 14
         run: mix realtime.export_tenant_db_catalog
 
       - name: Export Tenant DB dump
@@ -145,7 +142,7 @@ jobs:
         id: check-changes
         run: |
           git add priv/repo/tenant_db_catalog_15.json priv/repo/tenant_db_catalog_17.json \
-            priv/repo/tenant_db_dump_14.sql priv/repo/tenant_db_dump_15.sql priv/repo/tenant_db_dump_17.sql
+            priv/repo/tenant_db_dump_15.sql priv/repo/tenant_db_dump_17.sql
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
