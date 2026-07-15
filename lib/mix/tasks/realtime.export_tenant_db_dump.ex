@@ -81,10 +81,12 @@ defmodule Mix.Tasks.Realtime.ExportTenantDbDump do
 
     GenServer.stop(conn)
 
-    sql =
+    inserts =
       Enum.map_join(rows, fn [version] ->
-        "INSERT INTO realtime.\"schema_migrations\" (version, inserted_at) VALUES (#{version}, now());\n"
+        "INSERT INTO realtime.\"schema_migrations\" (version) VALUES (#{version});\n"
       end)
+
+    sql = "ALTER TABLE realtime.schema_migrations ALTER COLUMN inserted_at SET DEFAULT now();\n" <> inserts
 
     File.write!(path, sql, [:append])
   end
