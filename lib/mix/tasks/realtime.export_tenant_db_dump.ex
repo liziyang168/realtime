@@ -83,7 +83,7 @@ defmodule Mix.Tasks.Realtime.ExportTenantDbDump do
 
     sql =
       Enum.map_join(rows, fn [version] ->
-        "INSERT INTO realtime.\"schema_migrations\" (version) VALUES (#{version});\n"
+        "INSERT INTO realtime.\"schema_migrations\" (version, inserted_at) VALUES (#{version}, now());\n"
       end)
 
     File.write!(path, sql, [:append])
