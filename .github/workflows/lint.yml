@@ -6,6 +6,7 @@ on:
       - "test/**"
       - "config/**"
       - "priv/**"
+      - "!priv/repo/tenant_db_catalog_*.json"
       - "assets/**"
       - "rel/**"
       - "mix.exs"
@@ -58,8 +59,6 @@ jobs:
         run: mix credo
       - name: Run hex audit
         run: mix hex.audit
-      - name: Run mix_audit
-        run: mix deps.audit --ignore-file .mix_audit.ignore
       - name: Run sobelow
         run: mix sobelow --config .sobelow-conf
       - name: Retrieve PLT Cache

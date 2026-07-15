@@ -7,7 +7,6 @@ defmodule Realtime.Tenants.Migrations do
   use Realtime.Logs
 
   alias Realtime.Database
-  alias Realtime.FeatureFlags
   alias Realtime.Registry.Unique
   alias Realtime.Repo
   alias Realtime.Api.Tenant
@@ -94,10 +93,12 @@ defmodule Realtime.Tenants.Migrations do
     {20_260_603_120_000, Migrations.AddSendBinaryFunction},
     {20_260_605_120_000, Migrations.RenameBroadcastSendWarning},
     {20_260_606_110_000, Migrations.SubscriptionCheckFiltersUsePgAttribute},
-    {20_260_606_120_000, Migrations.SetupSupabaseRealtimeAdmin},
     {20_260_616_120_000, Migrations.AddPostgrestFilterOps},
     {20_260_624_120_000, Migrations.RevertPostgrestFilterOps},
-    {20_260_626_120_000, Migrations.ReAddPostgrestFilterOps}
+    {20_260_626_120_000, Migrations.ReAddPostgrestFilterOps},
+    {20_260_706_120_000, Migrations.GrantCheckEqualityOp5Arg},
+    {20_260_707_120_000, Migrations.RestrictRealtimeSchema},
+    {20_260_709_120_000, Migrations.FixApplyRlsFilterRoleLeak}
   ]
 
   defstruct [:tenant_external_id, :settings, migrations_ran: 0]
@@ -112,12 +113,7 @@ defmodule Realtime.Tenants.Migrations do
   """
   @spec run_migrations?(Tenant.t() | integer()) :: boolean()
   def run_migrations?(%Tenant{} = tenant) do
-    available_migrations =
-      tenant.external_id
-      |> migrations()
-      |> Enum.count()
-
-    tenant.migrations_ran < available_migrations
+    tenant.migrations_ran < Enum.count(migrations())
   end
 
   def run_migrations?(migrations_ran) when is_integer(migrations_ran),
@@ -225,12 +221,12 @@ defmodule Realtime.Tenants.Migrations do
         try do
           {applied_count, migrations_executed, source} =
             if migrations_ran == 0 do
-              case load_dump(settings, tenant_external_id) do
+              case load_dump(settings) do
                 {:ok, applied_count} -> {applied_count, applied_count, :dump}
-                {:error, _} -> run_pending_migrations(repo, tenant_external_id)
+                {:error, _} -> run_pending_migrations(repo)
               end
             else
-              run_pending_migrations(repo, tenant_external_id)
+              run_pending_migrations(repo)
             end
 
           metadata =
@@ -265,11 +261,11 @@ defmodule Realtime.Tenants.Migrations do
 
   @dump_timeout 30_000
 
-  defp load_dump(%Database{} = settings, tenant_external_id) do
+  defp load_dump(%Database{} = settings) do
     with {:ok, conn} <- Database.connect_db(%{settings | pool_size: 1}),
          {:ok, _} <- do_load_dump(conn),
          :ok <- GenServer.stop(conn) do
-      {:ok, Enum.count(migrations(tenant_external_id))}
+      {:ok, Enum.count(migrations())}
     else
       {:error, reason} = e ->
         log_error("TenantMigrationsDumpSkipped", reason)
@@ -277,10 +273,10 @@ defmodule Realtime.Tenants.Migrations do
     end
   end
 
-  defp run_pending_migrations(repo, tenant_external_id) do
+  defp run_pending_migrations(repo) do
     opts = [all: true, prefix: "realtime", dynamic_repo: repo]
-    result = Ecto.Migrator.run(Repo, migrations(tenant_external_id), :up, opts)
-    {Enum.count(migrations(tenant_external_id)), length(result), :migrator}
+    result = Ecto.Migrator.run(Repo, migrations(), :up, opts)
+    {Enum.count(migrations()), length(result), :migrator}
   end
 
   defp do_load_dump(conn) do
@@ -311,19 +307,6 @@ defmodule Realtime.Tenants.Migrations do
   @doc """
   Returns the migrations to run.
   """
-  @spec migrations(String.t() | nil) :: [{pos_integer(), module()}]
-  def migrations(tenant_external_id \\ nil) do
-    Enum.filter(@migrations, fn {_version, module} -> migration_enabled?(module, tenant_external_id) end)
-  end
-
-  defp migration_enabled?(Migrations.SetupSupabaseRealtimeAdmin, nil = _tenant_external_id) do
-    FeatureFlags.enabled?("use_supabase_realtime_admin")
-  end
-
-  defp migration_enabled?(Migrations.SetupSupabaseRealtimeAdmin, tenant_external_id)
-       when is_binary(tenant_external_id) do
-    FeatureFlags.enabled?("use_supabase_realtime_admin", tenant_external_id)
-  end
-
-  defp migration_enabled?(_migration, _tenant_external_id), do: true
+  @spec migrations() :: [{pos_integer(), module()}]
+  def migrations, do: @migrations
 end

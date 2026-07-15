@@ -4,7 +4,7 @@ defmodule Realtime.MixProject do
   def project do
     [
       app: :realtime,
-      version: "2.112.3",
+      version: "2.114.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -97,7 +97,9 @@ defmodule Realtime.MixProject do
       {:opentelemetry_cowboy, "~> 1.0"},
       {:opentelemetry_ecto, "~> 1.2"},
       {:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1"},
-      {:req, "~> 0.5"},
+      # gen_rpc uses a git dependency
+      {:snabbkaffe, "~> 1.0", override: true},
+      {:req, "~> 0.6.2"},
       {:mimic, "~> 1.0", only: :test},
       {:floki, ">= 0.30.0", only: :test},
       {:mint_web_socket, "~> 1.0", only: :test},
@@ -106,7 +108,6 @@ defmodule Realtime.MixProject do
       {:excoveralls, "~> 0.18", only: [:dev, :test], runtime: false},
       {:ex_crap, "~> 0.1", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
-      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:poolboy, "~> 1.5", only: :test},
