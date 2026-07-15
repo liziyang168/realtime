@@ -20,6 +20,6 @@ defmodule Realtime.Integration.TenantDbDumpTest do
 
     assert Migrations.run_migrations(tenant) == :ok
     assert_receive {:migrations_executed, executed}
-    assert executed == Enum.count(Migrations.migrations(tenant.external_id))
+    assert executed == Enum.count(Migrations.migrations())
   end
 end

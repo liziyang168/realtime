@@ -2,7 +2,8 @@ defmodule Mix.Tasks.Realtime.ExportTenantDbDump do
   @shortdoc "Regenerate priv/repo/tenant_db_dump_<pg_major>.sql"
 
   @moduledoc """
-  Dumps the tenant database's `realtime` schema `schema_migrations` to `priv/repo/tenant_db_dump_<pg_major>.sql`.
+  Dumps the tenant database's `realtime` schema to `priv/repo/tenant_db_dump_<pg_major>.sql`
+  and the `realtime.schema_migrations` rows.
 
   Usage:
 

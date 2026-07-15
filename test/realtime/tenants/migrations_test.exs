@@ -3,6 +3,9 @@ defmodule Realtime.Tenants.MigrationsTest do
   use Realtime.DataCase, async: false
   use Mimic
 
+  import ExUnit.CaptureLog
+
+  alias Realtime.Repo
   alias Realtime.Tenants.Cache
   alias Realtime.Tenants.Migrations
 
@@ -29,14 +32,68 @@ defmodule Realtime.Tenants.MigrationsTest do
       tenant = Containers.checkout_tenant()
 
       assert Migrations.run_migrations(tenant) == :ok
-      # Sleeping waiting for Cache to be invalided
-      Process.sleep(100)
-      assert Cache.get_tenant_by_external_id(tenant.external_id).migrations_ran == Enum.count(Migrations.migrations())
+
+      assert eventually(fn ->
+               Cache.get_tenant_by_external_id(tenant.external_id).migrations_ran == Enum.count(Migrations.migrations())
+             end)
     end
 
     test "migrations do not run if tenant has migrations_ran at the count of all migrations" do
       tenant = tenant_fixture(%{migrations_ran: Enum.count(Migrations.migrations())})
       assert Migrations.run_migrations(tenant) == :noop
+    end
+
+    test "reconciles migrations_ran instead of reloading the dump when the database is already migrated" do
+      tenant = Containers.checkout_tenant()
+      total = Enum.count(Migrations.migrations())
+
+      assert Migrations.run_migrations(tenant) == :ok
+      assert eventually(fn -> Cache.get_tenant_by_external_id(tenant.external_id).migrations_ran == total end)
+
+      :telemetry.attach(
+        "reconcile-test",
+        [:realtime, :tenants, :migrations, :stop],
+        fn _event, _measurements, metadata, %{pid: pid} -> send(pid, {:migrations_source, metadata.source}) end,
+        %{pid: self()}
+      )
+
+      on_exit(fn -> :telemetry.detach("reconcile-test") end)
+
+      stale_tenant = %{tenant | migrations_ran: 0}
+      assert Migrations.run_migrations(stale_tenant) == :ok
+      assert_receive {:migrations_source, :migrator}
+
+      assert eventually(fn -> Cache.get_tenant_by_external_id(tenant.external_id).migrations_ran == total end)
+    end
+  end
+
+  describe "load_db_dump?/2 database check" do
+    setup :set_mimic_global
+
+    test "falls back to sequential migrations without crashing when the schema_migrations check errors unexpectedly" do
+      tenant = Containers.checkout_tenant()
+      total = Enum.count(Migrations.migrations())
+
+      expect(Repo, :query, fn "SELECT count(*)::int FROM realtime.schema_migrations", [], _opts ->
+        {:error, %Postgrex.Error{postgres: %{code: :insufficient_privilege}}}
+      end)
+
+      log =
+        capture_log(fn ->
+          assert Migrations.run_migrations(tenant) == :ok
+        end)
+
+      assert log =~ "TenantMigrationsRanCheckFailed"
+
+      assert eventually(fn -> Cache.get_tenant_by_external_id(tenant.external_id).migrations_ran == total end)
+    end
+
+    test "does not check the database when migrations_ran is already greater than 0" do
+      tenant = %{Containers.checkout_tenant() | migrations_ran: 1}
+
+      reject(&Repo.query/3)
+
+      assert Migrations.run_migrations(tenant) == :ok
     end
   end
 

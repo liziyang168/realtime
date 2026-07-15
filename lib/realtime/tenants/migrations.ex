@@ -220,8 +220,8 @@ defmodule Realtime.Tenants.Migrations do
 
         try do
           {applied_count, migrations_executed, source} =
-            if migrations_ran == 0 do
-              case load_dump(settings) do
+            if load_db_dump?(migrations_ran, repo) do
+              case load_db_dump(settings) do
                 {:ok, applied_count} -> {applied_count, applied_count, :dump}
                 {:error, _} -> run_pending_migrations(repo)
               end
@@ -261,7 +261,7 @@ defmodule Realtime.Tenants.Migrations do
 
   @dump_timeout 30_000
 
-  defp load_dump(%Database{} = settings) do
+  defp load_db_dump(%Database{} = settings) do
     with {:ok, conn} <- Database.connect_db(%{settings | pool_size: 1}),
          {:ok, _} <- do_load_dump(conn),
          :ok <- GenServer.stop(conn) do
@@ -277,6 +277,29 @@ defmodule Realtime.Tenants.Migrations do
     opts = [all: true, prefix: "realtime", dynamic_repo: repo]
     result = Ecto.Migrator.run(Repo, migrations(), :up, opts)
     {Enum.count(migrations()), length(result), :migrator}
+  end
+
+  # Best-effort checking to find if it should load the DB dump or fallback to sequential migrations.
+  # `migrations_ran` can be stale on DB restore or cluster migration operations,
+  # so it needs to also query `realtime.schema_migrations` to make sure.
+  defp load_db_dump?(0 = _migrations_ran, repo), do: schema_migrations_empty?(repo)
+  defp load_db_dump?(_migrations_ran, _repo), do: false
+
+  defp schema_migrations_empty?(repo) do
+    case Repo.query("SELECT count(*)::int FROM realtime.schema_migrations", [], dynamic_repo: repo) do
+      {:ok, %{rows: [[0]]}} ->
+        true
+
+      {:ok, %{rows: [[_count]]}} ->
+        false
+
+      {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} ->
+        true
+
+      {:error, error} ->
+        log_warning("TenantMigrationsRanCheckFailed", error)
+        false
+    end
   end
 
   defp do_load_dump(conn) do
