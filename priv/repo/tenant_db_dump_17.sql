@@ -335,6 +335,18 @@ begin
 
                     execute 'execute walrus_rls_stmt' into subscription_has_access;
 
+                    -- Reset the role on every FOR..LOOP batch execution.
+                    -- The first batch of 10 rows is pre-fetched using the current connection role (PG internal behaviour)
+                    -- then we have to reset it again otherwise it would use the role defined in the `set_config` above
+                    -- to fetch the remaining rows when rows>10, which could be a user-defined role that lacks execution grants.
+                    -- The flow is:
+                    --   1. run batch with conn role
+                    --   2. set_config working_role
+                    --   3. execute walrus
+                    --   4. reset role (revert)
+                    --   5. repeat
+                    perform set_config('role', null, true);
+
                     if subscription_has_access then
                         visible_role_sub_ids = visible_role_sub_ids || subscription_id;
                     end if;
@@ -1164,9 +1176,9 @@ ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
 
 GRANT USAGE ON SCHEMA realtime TO postgres WITH GRANT OPTION;
 GRANT USAGE ON SCHEMA realtime TO anon;
-GRANT USAGE ON SCHEMA realtime TO authenticated;
 GRANT USAGE ON SCHEMA realtime TO service_role;
 GRANT ALL ON SCHEMA realtime TO supabase_realtime_admin WITH GRANT OPTION;
+GRANT USAGE ON SCHEMA realtime TO authenticated;
 
 
 --
@@ -1227,6 +1239,9 @@ GRANT ALL ON FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ 
 
 GRANT ALL ON FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ regtype, val_1 text, val_2 text, negate boolean) TO postgres;
 GRANT ALL ON FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ regtype, val_1 text, val_2 text, negate boolean) TO dashboard_user;
+GRANT ALL ON FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ regtype, val_1 text, val_2 text, negate boolean) TO anon;
+GRANT ALL ON FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ regtype, val_1 text, val_2 text, negate boolean) TO authenticated;
+GRANT ALL ON FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ regtype, val_1 text, val_2 text, negate boolean) TO service_role;
 
 
 --
@@ -1322,15 +1337,6 @@ GRANT ALL ON TABLE realtime.messages TO dashboard_user;
 GRANT SELECT,INSERT,UPDATE ON TABLE realtime.messages TO anon;
 GRANT SELECT,INSERT,UPDATE ON TABLE realtime.messages TO authenticated;
 GRANT SELECT,INSERT,UPDATE ON TABLE realtime.messages TO service_role;
-
-
---
--- Name: TABLE schema_migrations; Type: ACL; Schema: realtime; Owner: supabase_admin
---
-
-GRANT ALL ON TABLE realtime.schema_migrations TO postgres;
-GRANT ALL ON TABLE realtime.schema_migrations TO dashboard_user;
-GRANT ALL ON TABLE realtime.schema_migrations TO supabase_realtime_admin;
 
 
 --
@@ -1460,7 +1466,9 @@ INSERT INTO realtime."schema_migrations" (version) VALUES (20260528120000);
 INSERT INTO realtime."schema_migrations" (version) VALUES (20260603120000);
 INSERT INTO realtime."schema_migrations" (version) VALUES (20260605120000);
 INSERT INTO realtime."schema_migrations" (version) VALUES (20260606110000);
-INSERT INTO realtime."schema_migrations" (version) VALUES (20260606120000);
 INSERT INTO realtime."schema_migrations" (version) VALUES (20260616120000);
 INSERT INTO realtime."schema_migrations" (version) VALUES (20260624120000);
 INSERT INTO realtime."schema_migrations" (version) VALUES (20260626120000);
+INSERT INTO realtime."schema_migrations" (version) VALUES (20260706120000);
+INSERT INTO realtime."schema_migrations" (version) VALUES (20260707120000);
+INSERT INTO realtime."schema_migrations" (version) VALUES (20260709120000);
