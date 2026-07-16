@@ -20,9 +20,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-env:
-  POSTGRES_CLIENT_MAJOR: 17
-
 jobs:
   update-tenant-dump:
     name: Export catalog & dump (pg${{ matrix.pg_major }})
@@ -67,8 +64,8 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -y
-          sudo apt-get install -y "postgresql-client-${{ env.POSTGRES_CLIENT_MAJOR }}"
-          echo "/usr/lib/postgresql/${{ env.POSTGRES_CLIENT_MAJOR }}/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y "postgresql-client-${{ matrix.pg_major }}"
+          echo "/usr/lib/postgresql/${{ matrix.pg_major }}/bin" >> "$GITHUB_PATH"
 
       - name: Cache Docker images
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4

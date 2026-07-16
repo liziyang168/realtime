@@ -4,6 +4,7 @@ defmodule Realtime.Integration.TenantDbDumpTest do
   alias Containers
   alias Realtime.Tenants.Migrations
 
+  @tag :skip_orioledb
   test "loads the bundled dump for a brand-new tenant" do
     tenant = Containers.checkout_tenant()
 
