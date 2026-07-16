@@ -11,7 +11,7 @@ defmodule Realtime.Integration.TenantDbDumpTest do
       "tenant-db-dump-test",
       [:realtime, :tenants, :migrations, :stop],
       fn _event, _measurements, metadata, %{pid: pid} ->
-        send(pid, {:migrations_executed, metadata.migrations_executed})
+        send(pid, {:migrations_executed, metadata.migrations_executed, metadata.source})
       end,
       %{pid: self()}
     )
@@ -19,7 +19,7 @@ defmodule Realtime.Integration.TenantDbDumpTest do
     on_exit(fn -> :telemetry.detach("tenant-db-dump-test") end)
 
     assert Migrations.run_migrations(tenant) == :ok
-    assert_receive {:migrations_executed, executed}
+    assert_receive {:migrations_executed, executed, :dump}
     assert executed == Enum.count(Migrations.migrations())
   end
 end

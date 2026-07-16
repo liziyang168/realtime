@@ -221,7 +221,7 @@ defmodule Realtime.Tenants.Migrations do
         try do
           {applied_count, migrations_executed, source} =
             if load_db_dump?(migrations_ran, repo) do
-              case load_db_dump(settings) do
+              case load_db_dump(repo) do
                 {:ok, applied_count} -> {applied_count, applied_count, :dump}
                 {:error, _} -> run_pending_migrations(repo)
               end
@@ -261,10 +261,8 @@ defmodule Realtime.Tenants.Migrations do
 
   @dump_timeout 30_000
 
-  defp load_db_dump(%Database{} = settings) do
-    with {:ok, conn} <- Database.connect_db(%{settings | pool_size: 1}),
-         {:ok, _} <- do_load_dump(conn),
-         :ok <- GenServer.stop(conn) do
+  defp load_db_dump(repo) do
+    with {:ok, _} <- do_load_dump(repo) do
       {:ok, Enum.count(migrations())}
     else
       {:error, reason} = e ->
@@ -302,20 +300,20 @@ defmodule Realtime.Tenants.Migrations do
     end
   end
 
-  defp do_load_dump(conn) do
-    with {:ok, major} <- fetch_pg_major(conn),
+  defp do_load_dump(repo) do
+    with {:ok, major} <- fetch_pg_major(repo),
          {:ok, path} <- dump_path(major),
          {:ok, sql} <- File.read(path) do
-      Postgrex.query(conn, sql, [], query_type: :text, timeout: @dump_timeout)
+      Repo.query(sql, [], dynamic_repo: repo, query_type: :text, timeout: @dump_timeout)
     end
   end
 
-  defp fetch_pg_major(conn) do
+  defp fetch_pg_major(repo) do
     query = """
     SELECT current_setting('server_version_num'), EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'orioledb')
     """
 
-    case Postgrex.query(conn, query, [], timeout: @dump_timeout) do
+    case Repo.query(query, [], dynamic_repo: repo, timeout: @dump_timeout) do
       {:ok, %{rows: [[_version_num, true]]}} -> {:error, :orioledb_not_supported}
       {:ok, %{rows: [[version_num, false]]}} -> {:ok, version_num |> String.to_integer() |> div(10_000)}
       {:error, reason} -> {:error, reason}
