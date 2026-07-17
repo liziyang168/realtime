@@ -433,7 +433,7 @@ defmodule RealtimeWeb.RealtimeChannel do
           "Failed to generate JWT signer for key ID (kid) #{inspect(kid)}, check your JWT secret or JWKS configuration"
 
         log_error(socket, "JwtSignerError", msg)
-        shutdown_response(socket, :error_generating_signer)
+        shutdown_response(socket, msg)
 
       {:error, error} ->
         shutdown_response(socket, Realtime.Logs.to_log(error))

@@ -1203,6 +1203,45 @@ defmodule RealtimeWeb.RealtimeChannelTest do
         }
       }
     end
+
+    test "shuts down cleanly with JwtSignerError when the signer can no longer be generated", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{"log_level" => "warning"}, conn_opts(tenant, jwt))
+      %Socket{channel_pid: channel_pid} = subscribe_and_join!(socket, "realtime:test", %{})
+
+      log =
+        capture_log(fn ->
+          # The periodic re-confirmation re-validates the token; simulate the JWK backing the
+          # token's kid disappearing, which makes authorization fail to build a signer.
+          expect(RealtimeWeb.ChannelsAuthorization, :authorize_conn, fn _, _, _ ->
+            {:error, {:error_generating_signer, "key-id-1"}}
+          end)
+
+          allow(RealtimeWeb.ChannelsAuthorization, self(), channel_pid)
+
+          send(channel_pid, :confirm_token)
+          assert_process_down(channel_pid)
+        end)
+
+      assert log =~ "JwtSignerError"
+
+      # A clean shutdown (not a crash) pushes a system error message and closes normally.
+      assert_receive %Socket.Message{
+        topic: "realtime:test",
+        event: "system",
+        payload: %{
+          message: message,
+          status: "error",
+          extension: "system",
+          channel: "test"
+        }
+      }
+
+      assert message =~ "Failed to generate JWT signer for key ID (kid)"
+      assert message =~ "key-id-1"
+
+      assert_receive {:socket_close, ^channel_pid, :normal}
+    end
   end
 
   describe "access_token validations" do
